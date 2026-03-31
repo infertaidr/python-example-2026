@@ -6,3 +6,4 @@ scikit-learn==1.6.0
 scipy==1.13.1
 tqdm==4.67.1
 pyedflib
+neurokit2        
