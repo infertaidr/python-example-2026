@@ -82,7 +82,7 @@ def make_smart_features(df):
 # train_model: 훈련 함수 (필수!)
 ###############################################################
 
-def train_model(data_folder, model_folder):
+def train_model(data_folder, model_folder, verbose=False):
     """모델 훈련 및 저장"""
 
     print("훈련 시작...")
