@@ -85,18 +85,9 @@ def make_smart_features(df):
 def train_model(data_folder, model_folder, verbose=False):
     os.makedirs(model_folder, exist_ok=True)
     print("훈련 완료!")
- 
-###############################################################
-# run_model: 예측 함수 (필수!)
-###############################################################
 
-def run_model(data_folder, model_folder, output_folder):
-    demo_path = os.path.join(data_folder, 'demographics.csv')
-    df = pd.read_csv(demo_path)
-    os.makedirs(output_folder, exist_ok=True)
-    output = pd.DataFrame({
-        'BDSPPatientID': df['BDSPPatientID'],
-        'Cognitive_Impairment_Probability': 0.5
-    })
-    output.to_csv(os.path.join(output_folder, 'predictions.csv'), index=False)
-    print("예측 완료!")
+def load_model(model_folder, verbose=False):
+    return None
+
+def run_model(model, record, data_folder, verbose=False):
+    return 0, 0.5
