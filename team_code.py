@@ -3,16 +3,27 @@
 # ============================================================
 # PhysioNet Challenge 2026 | Team: Momochi-SleepAI
 #
-# Model    : RandomForestClassifier
+# Model    : RandomForestClassifier (hyperparameter tuned)
 # Features : 21개 CAISR-based sleep structure features
 # Validation: Site-based leave-one-out CV
-#   - S0001→I0006 AUROC: 0.6830
-#   - S0001→I0002 AUROC: 0.5787
+#   - S0001→I0006 AUROC: 0.7218
+#   - S0001→I0002 AUROC: 0.6728
+#
+# 주요 변경 이력:
+#   v1: proxy feature (AUROC 0.43 착시)
+#   v2: CAISR 14개 feature (0.67/0.49)
+#   v3: arousal clustering + stage별 호흡 추가 21개 (0.68/0.58)
+#   v4: RF 하이퍼파라미터 튜닝 (0.72/0.67) ← 현재
 #
 # Feature selection 근거:
-#   - 3개 site 모두에서 라벨과 일관된 상관관계를 보이는 feature 중심
+#   - 3개 site 모두에서 라벨과 일관된 상관관계 확인
+#   - human annotation audit 완료 → 21개 전체 유지
 #   - arousal_interval_std 제외 (site 간 분포 차이 너무 큼)
-#   - arousal clustering + stage별 호흡 burden 추가로 성능 개선
+#
+# RF 파라미터 근거:
+#   - max_features=0.5: feature subsampling으로 site 일반화 향상
+#   - min_samples_leaf=4: regularization으로 과적합 방지
+#   - max_depth=10: 적절한 깊이 제한
 # ============================================================
 
 import joblib
@@ -47,13 +58,26 @@ FEATURE_COLS = [
     'arousal_index',          # 각성 지수 (시간당)
     'ahi',                    # 무호흡-저호흡 지수
     'arousal_burstiness',     # arousal 간격 불규칙성
-    'arousal_cluster_ratio',  # 짧은 간격 arousal 비율 (clustering)
+    'arousal_cluster_ratio',  # 짧은 간격 arousal 비율
     'rem_arousal_ratio',      # REM 중 arousal 비율
     'ahi_rem',                # REM 중 AHI
     'ahi_nrem',               # NREM(N2) 중 AHI
     'ahi_n3',                 # N3 중 AHI
     'ahi_rem_nrem_ratio',     # REM/NREM AHI 비율
 ]
+
+# ============================================================
+# RF 하이퍼파라미터 (site-based CV로 튜닝 완료)
+# ============================================================
+RF_PARAMS = {
+    'n_estimators':    300,
+    'max_depth':       10,
+    'min_samples_leaf': 4,
+    'max_features':    0.5,
+    'class_weight':    'balanced',
+    'random_state':    42,
+    'n_jobs':          -1,
+}
 
 # ============================================================
 # 헬퍼 함수
@@ -70,7 +94,7 @@ def get_bout_lengths(stage_arr, stage_val):
     diff = np.diff(np.concatenate([[0], is_s, [0]]))
     starts = np.where(diff == 1)[0]
     ends   = np.where(diff == -1)[0]
-    return (ends - starts) * 0.5  # 30초 epoch → 분
+    return (ends - starts) * 0.5
 
 def resp_burden_by_stage(stage_arr, resp_sig, stage_val):
     """특정 수면 단계에서의 호흡 이벤트 burden (시간당)"""
@@ -175,7 +199,6 @@ def extract_caisr_features(edf_path):
         if arousal is not None:
             n_ar = count_events(arousal, 1)
             feat['arousal_index'] = float(n_ar / tst_hours)
-
             ar_onsets = np.where(np.diff((arousal == 1).astype(int)) == 1)[0]
             if len(ar_onsets) > 2:
                 intervals = np.diff(ar_onsets)
@@ -184,8 +207,8 @@ def extract_caisr_features(edf_path):
                 feat['arousal_cluster_ratio'] = float(np.mean(intervals < 120))
                 ar_epochs = (ar_onsets / 60).astype(int)
                 ar_epochs = ar_epochs[ar_epochs < total_epochs]
-                n_nrem_ar = np.sum(np.isin(stage_v[ar_epochs], [1, 2, 3]))
-                n_rem_ar  = np.sum(stage_v[ar_epochs] == 4)
+                n_nrem_ar = int(np.sum(np.isin(stage_v[ar_epochs], [1, 2, 3])))
+                n_rem_ar  = int(np.sum(stage_v[ar_epochs] == 4))
                 feat['rem_arousal_ratio'] = float(n_rem_ar / (n_nrem_ar + n_rem_ar + 1e-9))
             else:
                 feat['arousal_burstiness']    = np.nan
@@ -208,7 +231,7 @@ def extract_caisr_features(edf_path):
             feat['ahi_n3']   = resp_burden_by_stage(stage_v, resp, 1)
             feat['ahi_rem_nrem_ratio'] = float(
                 feat['ahi_rem'] / (feat['ahi_nrem'] + 0.01)
-            ) if feat['ahi_rem'] is not None and feat['ahi_nrem'] is not None else np.nan
+            ) if feat['ahi_rem'] is not None and not np.isnan(feat['ahi_rem']) else np.nan
         else:
             feat['ahi']              = np.nan
             feat['ahi_rem']          = np.nan
@@ -262,12 +285,7 @@ def train_model(data_folder, model_folder, verbose=False):
     imputer = SimpleImputer(strategy='median')
     X_imp = imputer.fit_transform(X)
 
-    model = RandomForestClassifier(
-        n_estimators=500,
-        class_weight='balanced',
-        random_state=42,
-        n_jobs=-1
-    )
+    model = RandomForestClassifier(**RF_PARAMS)
     model.fit(X_imp, y)
 
     joblib.dump(model,   os.path.join(model_folder, 'momochi_model.pkl'))
