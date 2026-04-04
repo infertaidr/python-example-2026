@@ -4,15 +4,15 @@
 # PhysioNet Challenge 2026 | Team: Momochi-SleepAI
 #
 # Model    : RandomForestClassifier
-# Features : 14개 CAISR-based sleep structure features
+# Features : 21개 CAISR-based sleep structure features
 # Validation: Site-based leave-one-out CV
-#   - S0001→I0006 AUROC: 0.6692
-#   - S0001→I0002 AUROC: 0.4892
+#   - S0001→I0006 AUROC: 0.6830
+#   - S0001→I0002 AUROC: 0.5787
 #
 # Feature selection 근거:
-#   - 3개 site 모두에서 라벨과 일관된 상관관계를 보이는 feature만 선택
-#   - arousal_interval_std는 site 간 분포 차이가 너무 커서 제외
-#     (I0006에서 std=2606으로 노이즈 심함 → 일반화 방해)
+#   - 3개 site 모두에서 라벨과 일관된 상관관계를 보이는 feature 중심
+#   - arousal_interval_std 제외 (site 간 분포 차이 너무 큼)
+#   - arousal clustering + stage별 호흡 burden 추가로 성능 개선
 # ============================================================
 
 import joblib
@@ -32,20 +32,27 @@ warnings.filterwarnings('ignore')
 # 확정 feature 목록 (순서 고정 - train/inference 동일하게 유지)
 # ============================================================
 FEATURE_COLS = [
-    'sleep_eff',             # 수면 효율
-    'n2_ratio',              # N2 비율
-    'wake_ratio',            # 각성 비율
-    'waso_min',              # 수면 후 각성 시간 (분)
-    'wake_bout_max',         # 최장 각성 구간 (분)
-    'transition_entropy',    # 수면 단계 전환 엔트로피
-    'n3_ratio_2nd',          # 후반부 N3 비율
-    'rem_ratio_1st',         # 전반부 REM 비율
-    'stage_confidence_min',  # CAISR 최소 신뢰도
-    'stage_entropy_std',     # CAISR 엔트로피 변동성
-    'prob_r_mean',           # REM 확률 평균
-    'prob_w_mean',           # Wake 확률 평균
-    'arousal_index',         # 각성 지수 (시간당)
-    'ahi',                   # 무호흡-저호흡 지수
+    'sleep_eff',              # 수면 효율
+    'n2_ratio',               # N2 비율
+    'wake_ratio',             # 각성 비율
+    'waso_min',               # 수면 후 각성 시간 (분)
+    'wake_bout_max',          # 최장 각성 구간 (분)
+    'transition_entropy',     # 수면 단계 전환 엔트로피
+    'n3_ratio_2nd',           # 후반부 N3 비율
+    'rem_ratio_1st',          # 전반부 REM 비율
+    'stage_confidence_min',   # CAISR 최소 신뢰도
+    'stage_entropy_std',      # CAISR 엔트로피 변동성
+    'prob_r_mean',            # REM 확률 평균
+    'prob_w_mean',            # Wake 확률 평균
+    'arousal_index',          # 각성 지수 (시간당)
+    'ahi',                    # 무호흡-저호흡 지수
+    'arousal_burstiness',     # arousal 간격 불규칙성
+    'arousal_cluster_ratio',  # 짧은 간격 arousal 비율 (clustering)
+    'rem_arousal_ratio',      # REM 중 arousal 비율
+    'ahi_rem',                # REM 중 AHI
+    'ahi_nrem',               # NREM(N2) 중 AHI
+    'ahi_n3',                 # N3 중 AHI
+    'ahi_rem_nrem_ratio',     # REM/NREM AHI 비율
 ]
 
 # ============================================================
@@ -64,6 +71,24 @@ def get_bout_lengths(stage_arr, stage_val):
     starts = np.where(diff == 1)[0]
     ends   = np.where(diff == -1)[0]
     return (ends - starts) * 0.5  # 30초 epoch → 분
+
+def resp_burden_by_stage(stage_arr, resp_sig, stage_val):
+    """특정 수면 단계에서의 호흡 이벤트 burden (시간당)"""
+    stage_epochs = len(stage_arr)
+    resp_in_stage = []
+    for ep in range(stage_epochs):
+        if stage_arr[ep] == stage_val:
+            r_start = ep * 30
+            r_end   = min(r_start + 30, len(resp_sig))
+            resp_in_stage.extend(resp_sig[r_start:r_end])
+    resp_in_stage = np.array(resp_in_stage)
+    if len(resp_in_stage) == 0:
+        return np.nan
+    n_events = (count_events(resp_in_stage, 1) +
+                count_events(resp_in_stage, 2) +
+                count_events(resp_in_stage, 4))
+    stage_hours = len(resp_in_stage) / 3600
+    return float(n_events / stage_hours) if stage_hours > 0 else np.nan
 
 def find_annot_file(patient_id, data_folder):
     """환자 ID로 CAISR annotation EDF 파일 경로 찾기"""
@@ -84,9 +109,8 @@ def find_annot_file(patient_id, data_folder):
 # ============================================================
 def extract_caisr_features(edf_path):
     """
-    CAISR annotation EDF에서 수면 구조 feature 추출
-    반환: dict (FEATURE_COLS에 해당하는 값들)
-    실패 시: 빈 dict 반환 → 나중에 median imputation
+    CAISR annotation EDF에서 수면 구조 feature 추출 (21개)
+    실패 시 빈 dict 반환 → median imputation
     """
     try:
         with pyedflib.EdfReader(edf_path) as f:
@@ -102,7 +126,6 @@ def extract_caisr_features(edf_path):
             arousal = f.readSignal(label_to_idx['arousal_caisr']) if 'arousal_caisr' in label_to_idx else None
             resp    = f.readSignal(label_to_idx['resp_caisr'])    if 'resp_caisr'    in label_to_idx else None
 
-        # 유효 epoch (9=unknown 제외)
         valid = stage != 9
         stage_v = stage[valid]
         total_epochs = len(stage_v)
@@ -141,30 +164,57 @@ def extract_caisr_features(edf_path):
         probs = np.stack([prob_n3, prob_n2, prob_n1, prob_r, prob_w], axis=1)
         prob_max = np.max(probs, axis=1)
         feat['stage_confidence_min'] = float(np.min(prob_max))
-
         probs_clip = np.clip(probs, 1e-9, 1)
         entropy = -np.sum(probs_clip * np.log(probs_clip), axis=1)
         feat['stage_entropy_std'] = float(np.std(entropy))
-
         feat['prob_r_mean'] = float(np.mean(prob_r))
         feat['prob_w_mean'] = float(np.mean(prob_w))
 
-        # 6. arousal index (onset 기준)
-        # ※ arousal_interval_std는 site 간 분포 차이가 너무 커서 제외
+        # 6. arousal index + clustering
+        # ※ arousal_interval_std 제외 (site 간 분포 차이 너무 큼)
         if arousal is not None:
             n_ar = count_events(arousal, 1)
             feat['arousal_index'] = float(n_ar / tst_hours)
-        else:
-            feat['arousal_index'] = np.nan
 
-        # 7. AHI (onset 기준)
+            ar_onsets = np.where(np.diff((arousal == 1).astype(int)) == 1)[0]
+            if len(ar_onsets) > 2:
+                intervals = np.diff(ar_onsets)
+                mu, sigma = np.mean(intervals), np.std(intervals)
+                feat['arousal_burstiness']    = float((sigma - mu) / (sigma + mu + 1e-9))
+                feat['arousal_cluster_ratio'] = float(np.mean(intervals < 120))
+                ar_epochs = (ar_onsets / 60).astype(int)
+                ar_epochs = ar_epochs[ar_epochs < total_epochs]
+                n_nrem_ar = np.sum(np.isin(stage_v[ar_epochs], [1, 2, 3]))
+                n_rem_ar  = np.sum(stage_v[ar_epochs] == 4)
+                feat['rem_arousal_ratio'] = float(n_rem_ar / (n_nrem_ar + n_rem_ar + 1e-9))
+            else:
+                feat['arousal_burstiness']    = np.nan
+                feat['arousal_cluster_ratio'] = np.nan
+                feat['rem_arousal_ratio']     = np.nan
+        else:
+            feat['arousal_index']         = np.nan
+            feat['arousal_burstiness']    = np.nan
+            feat['arousal_cluster_ratio'] = np.nan
+            feat['rem_arousal_ratio']     = np.nan
+
+        # 7. AHI + stage별 호흡 burden
         if resp is not None:
             n_oa = count_events(resp, 1)
             n_ca = count_events(resp, 2)
             n_hy = count_events(resp, 4)
-            feat['ahi'] = float((n_oa + n_ca + n_hy) / tst_hours)
+            feat['ahi']      = float((n_oa + n_ca + n_hy) / tst_hours)
+            feat['ahi_rem']  = resp_burden_by_stage(stage_v, resp, 4)
+            feat['ahi_nrem'] = resp_burden_by_stage(stage_v, resp, 2)
+            feat['ahi_n3']   = resp_burden_by_stage(stage_v, resp, 1)
+            feat['ahi_rem_nrem_ratio'] = float(
+                feat['ahi_rem'] / (feat['ahi_nrem'] + 0.01)
+            ) if feat['ahi_rem'] is not None and feat['ahi_nrem'] is not None else np.nan
         else:
-            feat['ahi'] = np.nan
+            feat['ahi']              = np.nan
+            feat['ahi_rem']          = np.nan
+            feat['ahi_nrem']         = np.nan
+            feat['ahi_n3']           = np.nan
+            feat['ahi_rem_nrem_ratio'] = np.nan
 
         return feat
 
@@ -187,7 +237,6 @@ def train_model(data_folder, model_folder, verbose=False):
         print(f'✅ 환자 수: {len(df)}명')
         print('🔄 CAISR feature 추출 중...')
 
-    # CAISR feature 추출
     records = []
     for _, row in df.iterrows():
         pid = row.get('BDSPPatientID', '')
@@ -200,23 +249,19 @@ def train_model(data_folder, model_folder, verbose=False):
     df_feat = pd.DataFrame(records)
     df_all = df.merge(df_feat, on='BDSPPatientID', how='left')
 
-    # 라벨
     if 'Cognitive_Impairment' in df_all.columns:
         y = df_all['Cognitive_Impairment'].astype(int)
     else:
         raise ValueError('라벨 컬럼(Cognitive_Impairment)을 찾을 수 없습니다.')
 
-    # X 준비 (feature 순서 고정)
     X = df_all[FEATURE_COLS].copy()
 
     if verbose:
         print(f'🤖 모델 학습 중... (feature: {len(FEATURE_COLS)}개, 샘플: {len(X)}명)')
 
-    # Imputer 학습 및 변환
     imputer = SimpleImputer(strategy='median')
     X_imp = imputer.fit_transform(X)
 
-    # RandomForest 학습
     model = RandomForestClassifier(
         n_estimators=500,
         class_weight='balanced',
@@ -225,7 +270,6 @@ def train_model(data_folder, model_folder, verbose=False):
     )
     model.fit(X_imp, y)
 
-    # 저장
     joblib.dump(model,   os.path.join(model_folder, 'momochi_model.pkl'))
     joblib.dump(imputer, os.path.join(model_folder, 'imputer.pkl'))
     with open(os.path.join(model_folder, 'features.json'), 'w') as f:
@@ -258,18 +302,15 @@ def run_model(model_dict, record, data_folder, verbose=False):
 
         patient_id = record.get('BDSPPatientID', '')
 
-        # CAISR feature 추출
         edf_path = find_annot_file(patient_id, data_folder)
         feat = {}
         if edf_path:
             feat = extract_caisr_features(edf_path)
 
-        # feature 순서 맞춰 DataFrame 생성
         row = {col: feat.get(col, np.nan) for col in features}
         X = pd.DataFrame([row])[features]
 
-        # Impute → 예측
-        X_imp = imputer.transform(X)
+        X_imp  = imputer.transform(X)
         prob   = float(clf.predict_proba(X_imp)[0][1])
         binary = int(prob >= 0.5)
 
