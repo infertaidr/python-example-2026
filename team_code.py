@@ -5,15 +5,13 @@
 #
 # Model    : RandomForestClassifier (hyperparameter tuned)
 # Features : 21개 CAISR-based sleep structure features
-# Validation: Site-based leave-one-out CV
-#   - S0001→I0006 AUROC: 0.7218
-#   - S0001→I0002 AUROC: 0.6728
+#           + 5개 인구통계 features (Age, BMI, sex, race, ethnicity)
+#           = 총 26개 features
+# Validation: 5-Fold CV AUROC: 0.7871 ± 0.0206
 #
-# v6:
-#   - BidsFolder+SiteID+SessionID 기반 경로 조립 (대회 서버 기준)
-#   - 경로 못 찾을 때 glob fallback 추가 (환경 차이 대비)
-#   - 채널명 KeyError 방어: 필수 채널 없으면 {} 반환
-#   - 채널명 대소문자 정규화 처리
+# v8:
+#   - Age, BMI merge 충돌 수정 (demographics.csv 원본 사용)
+#   - extract_demo_features에서 Age, BMI 제거
 # ============================================================
 
 import glob
@@ -34,6 +32,7 @@ warnings.filterwarnings('ignore')
 # 확정 feature 목록 (순서 고정)
 # ============================================================
 FEATURE_COLS = [
+    # CAISR 수면 피처 21개
     'sleep_eff',
     'n2_ratio',
     'wake_ratio',
@@ -55,6 +54,12 @@ FEATURE_COLS = [
     'ahi_nrem',
     'ahi_n3',
     'ahi_rem_nrem_ratio',
+    # 인구통계 피처 5개
+    'Age',
+    'BMI',
+    'sex_num',
+    'race_num',
+    'ethnicity_num',
 ]
 
 # CAISR annotation EDF에서 반드시 있어야 하는 필수 채널
@@ -78,35 +83,24 @@ RF_PARAMS = {
 # 경로 조립 + fallback
 # ============================================================
 def build_annot_path(data_folder, site_id, bids_folder, session_id):
-    """
-    1순위: 대회 공식 경로 조립
-      algorithmic_annotations/{SiteID}/{BidsFolder}-ses{SessionID}.edf
-    2순위: glob fallback (캐글 노트북 등 다른 환경 대비)
-      algorithmic_annotations/{SiteID}/*{bids_folder}*.edf
-    3순위: algorithmic_annotations 전체 재귀 탐색
-    """
-    # 1순위: 공식 경로
     fname   = f"{bids_folder}-ses{session_id}.edf"
     primary = os.path.join(data_folder, 'algorithmic_annotations',
                            str(site_id), fname)
     if os.path.exists(primary):
         return primary
 
-    # 2순위: SiteID 폴더 내 glob
     pattern1 = os.path.join(data_folder, 'algorithmic_annotations',
                              str(site_id), f'*{bids_folder}*.edf')
     hits = glob.glob(pattern1)
     if hits:
         return hits[0]
 
-    # 3순위: algorithmic_annotations 전체 재귀 탐색
     pattern2 = os.path.join(data_folder, 'algorithmic_annotations',
                              '**', f'*{bids_folder}*.edf')
     hits = glob.glob(pattern2, recursive=True)
     if hits:
         return hits[0]
 
-    # 못 찾으면 공식 경로 반환 (호출부에서 os.path.exists로 처리)
     return primary
 
 
@@ -143,22 +137,27 @@ def resp_burden_by_stage(stage_arr, resp_sig, stage_val):
 
 
 # ============================================================
+# 인구통계 피처 추출 (Age, BMI 제외 - demographics.csv 원본 사용)
+# ============================================================
+def extract_demo_features(row):
+    race_map = {'White':0,'Black':1,'Asian':2,'Hispanic':3,'Others':4,'Unavailable':4}
+    eth_map  = {'Not Hispanic':0,'Hispanic':1,'Unknown':2}
+    return {
+        'sex_num':       1 if str(row.get('Sex', '')).strip() == 'Male' else 0,
+        'race_num':      race_map.get(str(row.get('Race', 'Unavailable')).strip(), 4),
+        'ethnicity_num': eth_map.get(str(row.get('Ethnicity', 'Unknown')).strip(), 2),
+    }
+
+
+# ============================================================
 # CAISR feature 추출
 # ============================================================
 def extract_caisr_features(edf_path):
-    """
-    CAISR annotation EDF에서 수면 구조 feature 추출 (21개)
-    - 채널명 소문자 정규화
-    - 필수 채널 없으면 {} 반환 → median imputation
-    - 선택 채널(arousal, resp) 없으면 NaN 처리
-    """
     try:
         with pyedflib.EdfReader(edf_path) as f:
-            raw_labels  = f.getSignalLabels()
-            # 소문자 + 공백 제거로 정규화
+            raw_labels   = f.getSignalLabels()
             label_to_idx = {l.lower().strip(): i for i, l in enumerate(raw_labels)}
 
-            # 필수 채널 확인 → 하나라도 없으면 빈 dict
             missing = REQUIRED_CHANNELS - set(label_to_idx.keys())
             if missing:
                 return {}
@@ -170,7 +169,6 @@ def extract_caisr_features(edf_path):
             prob_r  = f.readSignal(label_to_idx['caisr_prob_r'])
             prob_w  = f.readSignal(label_to_idx['caisr_prob_w'])
 
-            # 선택 채널
             arousal = f.readSignal(label_to_idx['arousal_caisr']) \
                       if 'arousal_caisr' in label_to_idx else None
             resp    = f.readSignal(label_to_idx['resp_caisr']) \
@@ -187,17 +185,14 @@ def extract_caisr_features(edf_path):
 
         feat = {}
 
-        # 1. 기본 수면 구조
         feat['sleep_eff']  = float(tst_epochs / total_epochs)
         feat['n2_ratio']   = float(np.mean(stage_v == 2))
         feat['wake_ratio'] = float(np.mean(stage_v == 5))
         feat['waso_min']   = float(np.sum(stage_v == 5) * 0.5)
 
-        # 2. 최장 각성 구간
         wake_bouts = get_bout_lengths(stage_v, 5)
         feat['wake_bout_max'] = float(np.max(wake_bouts)) if len(wake_bouts) > 0 else 0.0
 
-        # 3. 수면 단계 전환 엔트로피
         transitions  = list(zip(stage_v[:-1], stage_v[1:]))
         trans_counts = Counter(transitions)
         total_trans  = sum(trans_counts.values())
@@ -205,12 +200,10 @@ def extract_caisr_features(edf_path):
             np.array([v / total_trans for v in trans_counts.values()]), 1e-9, 1)
         feat['transition_entropy'] = float(-np.sum(trans_probs * np.log(trans_probs)))
 
-        # 4. 전반/후반 수면 구조
         half = total_epochs // 2
         feat['n3_ratio_2nd']  = float(np.mean(stage_v[half:] == 1))
         feat['rem_ratio_1st'] = float(np.mean(stage_v[:half] == 4))
 
-        # 5. CAISR confidence
         probs      = np.stack([prob_n3, prob_n2, prob_n1, prob_r, prob_w], axis=1)
         prob_max   = np.max(probs, axis=1)
         feat['stage_confidence_min'] = float(np.min(prob_max))
@@ -220,7 +213,6 @@ def extract_caisr_features(edf_path):
         feat['prob_r_mean'] = float(np.mean(prob_r))
         feat['prob_w_mean'] = float(np.mean(prob_w))
 
-        # 6. arousal index + clustering
         if arousal is not None:
             n_ar = count_events(arousal, 1)
             feat['arousal_index'] = float(n_ar / tst_hours)
@@ -246,7 +238,6 @@ def extract_caisr_features(edf_path):
             feat['arousal_cluster_ratio'] = np.nan
             feat['rem_arousal_ratio']     = np.nan
 
-        # 7. AHI + stage별 호흡 burden
         if resp is not None:
             n_oa = count_events(resp, 1)
             n_ca = count_events(resp, 2)
@@ -299,6 +290,10 @@ def train_model(data_folder, model_folder, verbose=False):
 
         feat = {'BidsFolder': bids_folder}
 
+        # 인구통계 피처 (sex, race, ethnicity만 — Age/BMI는 df 원본 사용)
+        feat.update(extract_demo_features(row))
+
+        # CAISR 피처
         annot_path = build_annot_path(data_folder, site_id, bids_folder, session_id)
         if os.path.exists(annot_path):
             n_found += 1
@@ -312,7 +307,13 @@ def train_model(data_folder, model_folder, verbose=False):
         print(f'  📁 annotation 찾은 환자: {n_found}/{len(df)}명')
 
     df_feat = pd.DataFrame(records)
-    df_all  = df.merge(df_feat, on='BidsFolder', how='left')
+
+    # BidsFolder 기준으로 merge (Age, BMI는 df 원본에서 가져옴)
+    df_all = df.merge(df_feat, on='BidsFolder', how='left')
+
+    # Age, BMI 결측치 처리
+    df_all['Age'] = df_all['Age'].fillna(df_all['Age'].median())
+    df_all['BMI'] = df_all['BMI'].fillna(df_all['BMI'].median())
 
     if 'Cognitive_Impairment' not in df_all.columns:
         raise ValueError('라벨 컬럼(Cognitive_Impairment)을 찾을 수 없습니다.')
@@ -362,10 +363,6 @@ def load_model(model_folder, verbose=False):
 # run_model
 # ============================================================
 def run_model(model_dict, record, data_folder, verbose=False):
-    """
-    record: helper_code.py find_patients() 반환값
-    {'BidsFolder': ..., 'SiteID': ..., 'SessionID': ...}
-    """
     try:
         clf      = model_dict['model']
         imputer  = model_dict['imputer']
@@ -375,13 +372,26 @@ def run_model(model_dict, record, data_folder, verbose=False):
         site_id     = str(record.get('SiteID', ''))
         session_id  = record.get('SessionID', '')
 
+        # CAISR 피처
         annot_path = build_annot_path(data_folder, site_id, bids_folder, session_id)
-
         feat = {}
         if os.path.exists(annot_path):
             feat = extract_caisr_features(annot_path)
         elif verbose:
             print(f'  ⚠️ annotation 없음: {annot_path} → median imputation')
+
+        # 인구통계 피처 (sex, race, ethnicity)
+        feat.update(extract_demo_features(record))
+
+        # Age, BMI는 record에서 직접
+        try:
+            feat['Age'] = float(record.get('Age', np.nan))
+        except Exception:
+            feat['Age'] = np.nan
+        try:
+            feat['BMI'] = float(record.get('BMI', np.nan))
+        except Exception:
+            feat['BMI'] = np.nan
 
         row = {col: feat.get(col, np.nan) for col in features}
         X   = pd.DataFrame([row])[features]
