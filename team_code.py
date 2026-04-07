@@ -415,14 +415,26 @@ def run_model(model_dict, record, data_folder, verbose=False):
             if verbose:
                 print(f'  [경고] {bids_folder}: annotation 파일 없음 → median imputation')
 
-        feat.update(extract_demo_features(record))
+        # find_patients()는 BidsFolder/SiteID/SessionID만 반환
+        # → Age, BMI, Sex, Race, Ethnicity가 없으면 demographics.csv에서 보완
+        demo_record = dict(record)
+        if any(k not in demo_record for k in ['Age', 'BMI', 'Sex', 'Race', 'Ethnicity']):
+            demo_path = os.path.join(data_folder, 'demographics.csv')
+            if os.path.exists(demo_path):
+                df_demo = pd.read_csv(demo_path)
+                mask = (df_demo['BidsFolder'] == bids_folder) &                        (df_demo['SessionID'] == session_id)
+                rows = df_demo.loc[mask]
+                if not rows.empty:
+                    demo_record.update(rows.iloc[0].to_dict())
+
+        feat.update(extract_demo_features(demo_record))
 
         try:
-            feat['Age'] = float(record.get('Age', np.nan))
+            feat['Age'] = float(demo_record.get('Age', np.nan))
         except Exception:
             feat['Age'] = np.nan
         try:
-            feat['BMI'] = float(record.get('BMI', np.nan))
+            feat['BMI'] = float(demo_record.get('BMI', np.nan))
         except Exception:
             feat['BMI'] = np.nan
 
