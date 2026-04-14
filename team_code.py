@@ -1,29 +1,19 @@
-#!/usr/bin/env python
+ #!/usr/bin/env python
 
 # ============================================================
 # PhysioNet Challenge 2026 | Team: Momochi-SleepAI
 #
-# Model    : RandomForestClassifier (hybrid feature + tuned)
-# Features : 31개 = 15개 absolute + 16개 relative
-# Validation: Site-based leave-one-out CV
-#   - S0001→I0006 AUROC: 0.6744
-#   - S0001→I0002 AUROC: 0.6605
-#   - worst-case:  0.6605 (이전 0.5031 대비 대폭 개선)
+# Model : VotingClassifier (RandomForest + GradientBoosting)
+# Features : 26개 CAISR features + 6개 SaO2 features = 32개
 #
-# 주요 변경 이력:
-#   v1: proxy feature (착시 0.82)
-#   v2: CAISR 14개 (0.67/0.49)
-#   v3: arousal/resp 추가 21개 (0.68/0.58)
-#   v4: RF 하이퍼파라미터 튜닝 (0.72/0.67)
-#   v5: hybrid feature 31개 (0.674/0.661) ← 현재
-#
-# 핵심 인사이트:
-#   - absolute feature → I0006 강함 (site-specific severity)
-#   - relative feature → I0002 강함 (site-invariant structure)
-#   - hybrid → worst-case 최적화
-#   - 진짜 robust signal: ar_cluster, rem_ar_ratio, entropy_std
+# v10:
+# - raw EDF SaO2 feature 추가 (6개)
+#   → annotation 없는 검증셋/테스트셋 대응
+# - find_phys_file: physiological_data 경로 탐색
+# - extract_raw_features: SaO2 기반 6개 feature (속도 최적화)
 # ============================================================
 
+import glob
 import joblib
 import json
 import numpy as np
@@ -31,59 +21,279 @@ import os
 import pandas as pd
 import warnings
 from collections import Counter
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.impute import SimpleImputer, KNNImputer
 import pyedflib
 
 warnings.filterwarnings('ignore')
 
-# ============================================================
-# 확정 feature 목록 (순서 고정)
-# ============================================================
+# 전체 모델: CAISR 26개 + SaO2 6개 = 32개
 FEATURE_COLS = [
-    # absolute (15개)
-    'tst_min', 'sleep_eff', 'n3_ratio', 'n2_ratio', 'rem_ratio', 'wake_ratio',
-    'n3_ratio_2nd', 'rem_ratio_1st', 'transition_rate',
-    'prob_n3_mean', 'prob_r_mean', 'prob_w_mean', 'stage_entropy_std',
-    'arousal_index', 'ahi',
-    # relative (16개)
-    'wake_sleep_ratio', 'n3_rem_ratio', 'n3_n2_ratio', 'rem_nrem_ratio', 'nrem_rem_ratio',
-    'n3_shift', 'rem_shift', 'wake_shift', 'n3_front_loading', 'rem_back_loading',
-    'prob_w_minus_n3', 'prob_w_over_r',
-    'rem_arousal_ratio', 'arousal_cluster_ratio',
-    'ca_ratio', 'rem_nrem_resp_ratio',
+    # CAISR features (21개)
+    'sleep_eff', 'n2_ratio', 'wake_ratio', 'waso_min', 'wake_bout_max',
+    'transition_entropy', 'n3_ratio_2nd', 'rem_ratio_1st',
+    'stage_confidence_min', 'stage_entropy_std', 'prob_r_mean',
+    'prob_w_mean', 'arousal_index', 'ahi', 'arousal_burstiness',
+    'arousal_cluster_ratio', 'rem_arousal_ratio', 'ahi_rem', 'ahi_nrem',
+    'ahi_n3', 'ahi_rem_nrem_ratio',
+    # demographics (5개)
+    'Age', 'BMI', 'sex_num', 'race_num', 'ethnicity_num',
+    # raw EDF features (6개) → SaO2 기반, annotation 없어도 추출 가능
+    'sao2_mean', 'sao2_min', 'sao2_std',
+    'sao2_below90', 'sao2_below85', 'odi4',
 ]
 
-RF_PARAMS = {
-    'n_estimators':     300,
-    'max_depth':        10,
-    'min_samples_leaf': 8,
-    'max_features':     0.4,
-    'class_weight':     'balanced',
-    'random_state':     42,
-    'n_jobs':           -1,
+# 슬림 모델: annotation 없을 때 사용 (SaO2 6개 + demographics 5개 = 11개)
+FEATURE_COLS_SLIM = [
+    'Age', 'BMI', 'sex_num', 'race_num', 'ethnicity_num',
+    'sao2_mean', 'sao2_min', 'sao2_std',
+    'sao2_below90', 'sao2_below85', 'odi4',
+]
+
+CLIP_RANGES = {
+    'sleep_eff': (0.0, 1.0),
+    'n2_ratio': (0.0, 1.0),
+    'wake_ratio': (0.0, 1.0),
+    'waso_min': (0.0, 600.0),
+    'wake_bout_max': (0.0, 300.0),
+    'transition_entropy': (0.0, 5.0),
+    'n3_ratio_2nd': (0.0, 1.0),
+    'rem_ratio_1st': (0.0, 1.0),
+    'stage_confidence_min': (0.0, 1.0),
+    'stage_entropy_std': (0.0, 2.0),
+    'prob_r_mean': (0.0, 1.0),
+    'prob_w_mean': (0.0, 1.0),
+    'arousal_index': (0.0, 150.0),
+    'ahi': (0.0, 150.0),
+    'arousal_burstiness': (-1.0, 1.0),
+    'arousal_cluster_ratio': (0.0, 1.0),
+    'rem_arousal_ratio': (0.0, 1.0),
+    'ahi_rem': (0.0, 150.0),
+    'ahi_nrem': (0.0, 150.0),
+    'ahi_n3': (0.0, 150.0),
+    'ahi_rem_nrem_ratio': (0.0, 20.0),
+    'Age': (18.0, 100.0),
+    'BMI': (10.0, 70.0),
+    'sao2_mean': (50.0, 100.0),
+    'sao2_min': (50.0, 100.0),
+    'sao2_std': (0.0, 10.0),
+    'sao2_below90': (0.0, 1.0),
+    'sao2_below85': (0.0, 1.0),
+    'odi4': (0.0, 500.0),
 }
 
-# ============================================================
-# 헬퍼 함수
-# ============================================================
+REQUIRED_CHANNELS = {'stage_caisr', 'caisr_prob_n3', 'caisr_prob_n2',
+                     'caisr_prob_n1', 'caisr_prob_r', 'caisr_prob_w'}
+
+RF_PARAMS = {
+    'n_estimators': 200,
+    'max_depth': 5,
+    'min_samples_leaf': 12,
+    'min_samples_split': 20,
+    'max_features': 'sqrt',
+    'max_samples': 0.8,
+    'class_weight': 'balanced_subsample',
+    'random_state': 42,
+    'n_jobs': -1,
+}
+
+GB_PARAMS = {
+    'n_estimators': 150,
+    'max_depth': 3,
+    'min_samples_leaf': 10,
+    'learning_rate': 0.05,
+    'subsample': 0.8,
+    'max_features': 'sqrt',
+    'random_state': 42,
+}
+
+
+# ── 경로 탐색 ──────────────────────────────────────────────
+
+def build_annot_path(data_folder, site_id, bids_folder, session_id):
+    fname = f"{bids_folder}_ses-{session_id}_caisr_annotations.edf"
+    primary = os.path.join(data_folder, 'algorithmic_annotations',
+                           str(site_id), fname)
+    if os.path.exists(primary):
+        return primary
+    pattern1 = os.path.join(data_folder, 'algorithmic_annotations',
+                            str(site_id), f'*{bids_folder}*.edf')
+    hits = glob.glob(pattern1)
+    if hits:
+        return hits[0]
+    pattern2 = os.path.join(data_folder, 'algorithmic_annotations',
+                            '**', f'*{bids_folder}*.edf')
+    hits = glob.glob(pattern2, recursive=True)
+    if hits:
+        return hits[0]
+    return primary
+
+
+def find_phys_file(data_folder, site_id, bids_folder, session_id):
+    """raw physiological EDF 경로 탐색"""
+    fname = f"{bids_folder}_ses-{session_id}.edf"
+    primary = os.path.join(data_folder, 'physiological_data',
+                           str(site_id), fname)
+    if os.path.exists(primary):
+        return primary
+    pattern1 = os.path.join(data_folder, 'physiological_data',
+                            str(site_id), f'*{bids_folder}*.edf')
+    hits = glob.glob(pattern1)
+    if hits:
+        return hits[0]
+    pattern2 = os.path.join(data_folder, 'physiological_data',
+                            '**', f'*{bids_folder}*.edf')
+    hits = glob.glob(pattern2, recursive=True)
+    if hits:
+        return hits[0]
+    return None
+
+
+# ── 헬퍼 함수 ─────────────────────────────────────────────
+
+
+def build_human_annot_path(data_folder, site_id, bids_folder, session_id):
+    fname = f"{bids_folder}_ses-{session_id}_expert_annotations.edf"
+    primary = os.path.join(data_folder, 'human_annotations', str(site_id), fname)
+    if os.path.exists(primary):
+        return primary
+    pattern = os.path.join(data_folder, 'human_annotations', '**', f'*{bids_folder}*.edf')
+    hits = glob.glob(pattern, recursive=True)
+    return hits[0] if hits else None
+
+
+def extract_human_features(edf_path):
+    try:
+        with pyedflib.EdfReader(edf_path) as f:
+            raw_labels = f.getSignalLabels()
+            lbl = {l.lower().strip(): i for i, l in enumerate(raw_labels)}
+
+            if 'stage_expert' not in lbl:
+                return {}
+
+            stage = f.readSignal(lbl['stage_expert'])
+            arousal = f.readSignal(lbl['arousal_expert']) if 'arousal_expert' in lbl else None
+            resp = None
+            resp_fs = 1
+            if 'resp_expert' in lbl:
+                resp_idx = lbl['resp_expert']
+                resp = f.readSignal(resp_idx)
+                resp_fs = int(f.getSampleFrequency(resp_idx)) or 1
+
+            valid = stage != 9
+            stage_v = stage[valid]
+            total_epochs = len(stage_v)
+            tst_epochs = np.sum(stage_v != 5)
+            tst_hours = tst_epochs * 30 / 3600
+
+            if total_epochs == 0 or tst_hours == 0:
+                return {}
+
+            feat = {}
+            feat['sleep_eff'] = float(tst_epochs / total_epochs)
+            feat['n2_ratio'] = float(np.mean(stage_v == 2))
+            feat['wake_ratio'] = float(np.mean(stage_v == 5))
+            feat['waso_min'] = float(np.sum(stage_v == 5) * 0.5)
+
+            wake_bouts = get_bout_lengths(stage_v, 5)
+            feat['wake_bout_max'] = float(np.max(wake_bouts)) if len(wake_bouts) > 0 else 0.0
+
+            transitions = list(zip(stage_v[:-1], stage_v[1:]))
+            trans_counts = Counter(transitions)
+            total_trans = sum(trans_counts.values())
+            trans_probs = np.clip(
+                np.array([v / total_trans for v in trans_counts.values()]), 1e-9, 1)
+            feat['transition_entropy'] = float(-np.sum(trans_probs * np.log(trans_probs)))
+
+            half = total_epochs // 2
+            feat['n3_ratio_2nd'] = float(np.mean(stage_v[half:] == 1))
+            feat['rem_ratio_1st'] = float(np.mean(stage_v[:half] == 4))
+
+            # human annotation은 prob 채널 없음 → NaN
+            feat['stage_confidence_min'] = np.nan
+            feat['stage_entropy_std'] = np.nan
+            feat['prob_r_mean'] = np.nan
+            feat['prob_w_mean'] = np.nan
+
+            if arousal is not None:
+                n_ar = count_events(arousal, 1)
+                feat['arousal_index'] = float(n_ar / tst_hours)
+                ar_onsets = np.where(np.diff((arousal == 1).astype(int)) == 1)[0]
+                if len(ar_onsets) > 2:
+                    intervals = np.diff(ar_onsets)
+                    mu, sigma = np.mean(intervals), np.std(intervals)
+                    feat['arousal_burstiness'] = float((sigma - mu) / (sigma + mu + 1e-9))
+                    feat['arousal_cluster_ratio'] = float(np.mean(intervals < 120))
+                    ar_epochs = (ar_onsets / 60).astype(int)
+                    ar_epochs = ar_epochs[ar_epochs < total_epochs]
+                    n_nrem_ar = int(np.sum(np.isin(stage_v[ar_epochs], [1, 2, 3])))
+                    n_rem_ar = int(np.sum(stage_v[ar_epochs] == 4))
+                    feat['rem_arousal_ratio'] = float(n_rem_ar / (n_nrem_ar + n_rem_ar + 1e-9))
+                else:
+                    feat['arousal_burstiness'] = np.nan
+                    feat['arousal_cluster_ratio'] = np.nan
+                    feat['rem_arousal_ratio'] = np.nan
+            else:
+                feat['arousal_index'] = np.nan
+                feat['arousal_burstiness'] = np.nan
+                feat['arousal_cluster_ratio'] = np.nan
+                feat['rem_arousal_ratio'] = np.nan
+
+            if resp is not None:
+                n_oa = count_events(resp, 1)
+                n_ca = count_events(resp, 2)
+                n_hy = count_events(resp, 4)
+                feat['ahi'] = float((n_oa + n_ca + n_hy) / tst_hours)
+                feat['ahi_rem'] = resp_burden_by_stage(stage_v, resp, 4, fs=resp_fs)
+                feat['ahi_nrem'] = resp_burden_by_stage(stage_v, resp, 2, fs=resp_fs)
+                feat['ahi_n3'] = resp_burden_by_stage(stage_v, resp, 1, fs=resp_fs)
+                ahi_rem = feat['ahi_rem']
+                ahi_nrem = feat['ahi_nrem']
+                if ahi_rem is not None and not np.isnan(ahi_rem):
+                    feat['ahi_rem_nrem_ratio'] = float(ahi_rem / (ahi_nrem + 0.01))
+                else:
+                    feat['ahi_rem_nrem_ratio'] = np.nan
+            else:
+                feat['ahi'] = np.nan
+                feat['ahi_rem'] = np.nan
+                feat['ahi_nrem'] = np.nan
+                feat['ahi_n3'] = np.nan
+                feat['ahi_rem_nrem_ratio'] = np.nan
+
+            return feat
+
+    except Exception:
+        return {}
+
+def find_channel(labels, candidates):
+    """대소문자/공백 무시하고 채널 인덱스 반환"""
+    labels_lower = [l.lower().strip() for l in labels]
+    for c in candidates:
+        if c.lower().strip() in labels_lower:
+            return labels_lower.index(c.lower().strip())
+    return None
+
+
 def count_events(signal, value):
     is_event = (signal == value)
     return int(np.sum(np.diff(is_event.astype(int)) == 1))
+
 
 def get_bout_lengths(stage_arr, stage_val):
     is_s = (stage_arr == stage_val).astype(int)
     diff = np.diff(np.concatenate([[0], is_s, [0]]))
     starts = np.where(diff == 1)[0]
-    ends   = np.where(diff == -1)[0]
+    ends = np.where(diff == -1)[0]
     return (ends - starts) * 0.5
 
-def resp_burden_by_stage(stage_arr, resp_sig, stage_val):
+
+def resp_burden_by_stage(stage_arr, resp_sig, stage_val, fs=1):
+    epoch_samples = int(30 * fs)
     resp_in_stage = []
     for ep in range(len(stage_arr)):
         if stage_arr[ep] == stage_val:
-            r_start = ep * 30
-            r_end   = min(r_start + 30, len(resp_sig))
+            r_start = ep * epoch_samples
+            r_end = min(r_start + epoch_samples, len(resp_sig))
             resp_in_stage.extend(resp_sig[r_start:r_end])
     resp_in_stage = np.array(resp_in_stage)
     if len(resp_in_stage) == 0:
@@ -91,232 +301,437 @@ def resp_burden_by_stage(stage_arr, resp_sig, stage_val):
     n_events = (count_events(resp_in_stage, 1) +
                 count_events(resp_in_stage, 2) +
                 count_events(resp_in_stage, 4))
-    stage_hours = len(resp_in_stage) / 3600
+    stage_hours = len(resp_in_stage) / (fs * 3600)
     return float(n_events / stage_hours) if stage_hours > 0 else np.nan
 
-def find_annot_file(patient_id, data_folder):
-    annot_base = os.path.join(data_folder, 'algorithmic_annotations')
-    if not os.path.exists(annot_base):
-        return None
-    for site_folder in os.listdir(annot_base):
-        site_path = os.path.join(annot_base, site_folder)
-        if not os.path.isdir(site_path):
-            continue
-        for fname in os.listdir(site_path):
-            if str(patient_id) in fname and fname.endswith('.edf'):
-                return os.path.join(site_path, fname)
-    return None
 
-# ============================================================
-# Feature 추출 (absolute + relative hybrid)
-# ============================================================
-def extract_hybrid_features(edf_path):
+# ── Feature 추출 ───────────────────────────────────────────
+
+def extract_demo_features(row):
+    race_map = {'White': 0, 'Black': 1, 'Asian': 2, 'Hispanic': 3,
+                'Others': 4, 'Unavailable': 4}
+    eth_map = {'Not Hispanic': 0, 'Hispanic': 1, 'Unknown': 2}
+    return {
+        'sex_num': 1 if str(row.get('Sex', '')).strip() == 'Male' else 0,
+        'race_num': race_map.get(str(row.get('Race', 'Unavailable')).strip(), 4),
+        'ethnicity_num': eth_map.get(str(row.get('Ethnicity', 'Unknown')).strip(), 2),
+    }
+
+
+def extract_raw_features(edf_path):
+    """raw physiological EDF에서 SaO2 + Airflow 기반 feature 추출"""
     try:
         with pyedflib.EdfReader(edf_path) as f:
             labels = f.getSignalLabels()
-            lbl = {l: i for i, l in enumerate(labels)}
-            stage   = f.readSignal(lbl['stage_caisr'])
-            prob_n3 = f.readSignal(lbl['caisr_prob_n3'])
-            prob_n2 = f.readSignal(lbl['caisr_prob_n2'])
-            prob_n1 = f.readSignal(lbl['caisr_prob_n1'])
-            prob_r  = f.readSignal(lbl['caisr_prob_r'])
-            prob_w  = f.readSignal(lbl['caisr_prob_w'])
-            arousal = f.readSignal(lbl['arousal_caisr']) if 'arousal_caisr' in lbl else None
-            resp    = f.readSignal(lbl['resp_caisr'])    if 'resp_caisr'    in lbl else None
+            feat = {}
 
-        valid = stage != 9
-        sv    = stage[valid]
-        total = len(sv)
-        tst   = int(np.sum(sv != 5))
-        tst_h = tst * 30 / 3600
-        if total == 0 or tst_h == 0:
-            return {}
+            # ── SaO2 ──────────────────────────────────────
+            sao2_idx = find_channel(labels, ['SaO2', 'SpO2', 'sao2', 'SAO2'])
+            if sao2_idx is not None:
+                sao2 = f.readSignal(sao2_idx)
+                sao2_fs = f.getSampleFrequency(sao2_idx)
+                sao2 = sao2[(sao2 > 50) & (sao2 <= 100)]
+                if len(sao2) > 0:
+                    feat['sao2_mean'] = float(np.mean(sao2))
+                    feat['sao2_min'] = float(np.min(sao2))
+                    feat['sao2_std'] = float(np.std(sao2))
+                    feat['sao2_below90'] = float(np.mean(sao2 < 90))
+                    feat['sao2_below85'] = float(np.mean(sao2 < 85))
+                    # ODI4: 4% 산소포화도 저하 횟수
+                    baseline = np.percentile(sao2, 90)
+                    drops = np.diff((sao2 < (baseline - 4)).astype(int))
+                    feat['odi4'] = float(np.sum(drops == 1))
+                else:
+                    for k in ['sao2_mean', 'sao2_min', 'sao2_std',
+                              'sao2_below90', 'sao2_below85', 'odi4']:
+                        feat[k] = np.nan
+            else:
+                for k in ['sao2_mean', 'sao2_min', 'sao2_std',
+                          'sao2_below90', 'sao2_below85', 'odi4']:
+                    feat[k] = np.nan
 
-        half = total // 2
-        eps  = 1e-9
+            # Airflow 제거 → SaO2만 사용 (속도 최적화)
 
-        n3        = float(np.mean(sv == 1))
-        n2        = float(np.mean(sv == 2))
-        rem       = float(np.mean(sv == 4))
-        wake      = float(np.mean(sv == 5))
-        sleep_eff = tst / total
-
-        # entropy (한 번만 계산)
-        probs_stack = np.stack([prob_n3, prob_n2, prob_n1, prob_r, prob_w], axis=1)
-        probs_clip  = np.clip(probs_stack, 1e-9, 1)
-        entropy     = -np.sum(probs_clip * np.log(probs_clip), axis=1)
-
-        # resp events (한 번만 계산)
-        if resp is not None:
-            n_oa = count_events(resp, 1)
-            n_ca = count_events(resp, 2)
-            n_hy = count_events(resp, 4)
-            total_resp = n_oa + n_ca + n_hy
-
-        feat = {}
-
-        # ── Absolute features (15개) ──────────────────────
-        feat['tst_min']           = tst * 0.5
-        feat['sleep_eff']         = sleep_eff
-        feat['n3_ratio']          = n3
-        feat['n2_ratio']          = n2
-        feat['rem_ratio']         = rem
-        feat['wake_ratio']        = wake
-        feat['n3_ratio_2nd']      = float(np.mean(sv[half:] == 1))
-        feat['rem_ratio_1st']     = float(np.mean(sv[:half] == 4))
-        feat['transition_rate']   = float(np.sum(np.diff(sv) != 0) / total)
-        feat['prob_n3_mean']      = float(np.mean(prob_n3))
-        feat['prob_r_mean']       = float(np.mean(prob_r))
-        feat['prob_w_mean']       = float(np.mean(prob_w))
-        feat['stage_entropy_std'] = float(np.std(entropy))
-        feat['arousal_index']     = (
-            count_events(arousal, 1) / tst_h if arousal is not None else np.nan
-        )
-        feat['ahi'] = (
-            (n_oa + n_ca + n_hy) / tst_h if resp is not None else np.nan
-        )
-
-        # ── Relative features (16개) ──────────────────────
-        feat['wake_sleep_ratio']  = wake / (sleep_eff + eps)
-        feat['n3_rem_ratio']      = n3   / (rem + eps)
-        feat['n3_n2_ratio']       = n3   / (n2 + eps)
-        feat['rem_nrem_ratio']    = rem  / (n2 + n3 + eps)
-        feat['nrem_rem_ratio']    = (n2 + n3) / (rem + eps)
-
-        n3_1st   = float(np.mean(sv[:half] == 1))
-        n3_2nd   = float(np.mean(sv[half:] == 1))
-        rem_1st  = float(np.mean(sv[:half] == 4))
-        rem_2nd  = float(np.mean(sv[half:] == 4))
-        wake_1st = float(np.mean(sv[:half] == 5))
-        wake_2nd = float(np.mean(sv[half:] == 5))
-
-        feat['n3_shift']          = n3_2nd  - n3_1st
-        feat['rem_shift']         = rem_2nd - rem_1st
-        feat['wake_shift']        = wake_2nd - wake_1st
-        feat['n3_front_loading']  = n3_1st  / (n3_2nd  + eps)
-        feat['rem_back_loading']  = rem_2nd / (rem_1st + eps)
-        feat['prob_w_minus_n3']   = float(np.mean(prob_w) - np.mean(prob_n3))
-        feat['prob_w_over_r']     = float(np.mean(prob_w) / (np.mean(prob_r) + eps))
-
-        if arousal is not None:
-            ar_onsets = np.where(np.diff((arousal==1).astype(int)) == 1)[0]
-            ar_epochs = (ar_onsets / 60).astype(int)
-            ar_epochs = ar_epochs[ar_epochs < total]
-            n_rem_ar  = int(np.sum(sv[ar_epochs] == 4))
-            n_nrem_ar = int(np.sum(np.isin(sv[ar_epochs], [1,2,3])))
-            feat['rem_arousal_ratio']     = float(n_rem_ar / (n_nrem_ar + n_rem_ar + eps))
-            feat['arousal_cluster_ratio'] = (
-                float(np.mean(np.diff(ar_onsets) < 120))
-                if len(ar_onsets) > 2 else np.nan
-            )
-        else:
-            feat['rem_arousal_ratio']     = np.nan
-            feat['arousal_cluster_ratio'] = np.nan
-
-        if resp is not None:
-            feat['ca_ratio'] = float(n_ca / (total_resp + eps))
-            rem_resp  = resp_burden_by_stage(sv, resp, 4)
-            nrem_resp = resp_burden_by_stage(sv, resp, 2)
-            feat['rem_nrem_resp_ratio'] = (
-                float(rem_resp / (nrem_resp + eps))
-                if rem_resp is not None and not np.isnan(rem_resp) else np.nan
-            )
-        else:
-            feat['ca_ratio']            = np.nan
-            feat['rem_nrem_resp_ratio'] = np.nan
-
-        return feat
+            return feat
 
     except Exception:
         return {}
 
-# ============================================================
-# train_model
-# ============================================================
+
+def extract_caisr_features(edf_path):
+    try:
+        with pyedflib.EdfReader(edf_path) as f:
+            raw_labels = f.getSignalLabels()
+            label_to_idx = {l.lower().strip(): i for i, l in enumerate(raw_labels)}
+
+            missing = REQUIRED_CHANNELS - set(label_to_idx.keys())
+            if missing:
+                return {}
+
+            stage = f.readSignal(label_to_idx['stage_caisr'])
+            prob_n3 = f.readSignal(label_to_idx['caisr_prob_n3'])
+            prob_n2 = f.readSignal(label_to_idx['caisr_prob_n2'])
+            prob_n1 = f.readSignal(label_to_idx['caisr_prob_n1'])
+            prob_r = f.readSignal(label_to_idx['caisr_prob_r'])
+            prob_w = f.readSignal(label_to_idx['caisr_prob_w'])
+
+            arousal = f.readSignal(label_to_idx['arousal_caisr']) \
+                if 'arousal_caisr' in label_to_idx else None
+            resp = None
+            resp_fs = 1
+            if 'resp_caisr' in label_to_idx:
+                resp_idx = label_to_idx['resp_caisr']
+                resp = f.readSignal(resp_idx)
+                resp_fs = int(f.getSampleFrequency(resp_idx)) or 1
+
+            valid = stage != 9
+            stage_v = stage[valid]
+            total_epochs = len(stage_v)
+            tst_epochs = np.sum(stage_v != 5)
+            tst_hours = tst_epochs * 30 / 3600
+
+            if total_epochs == 0 or tst_hours == 0:
+                return {}
+
+            feat = {}
+            feat['sleep_eff'] = float(tst_epochs / total_epochs)
+            feat['n2_ratio'] = float(np.mean(stage_v == 2))
+            feat['wake_ratio'] = float(np.mean(stage_v == 5))
+            feat['waso_min'] = float(np.sum(stage_v == 5) * 0.5)
+
+            wake_bouts = get_bout_lengths(stage_v, 5)
+            feat['wake_bout_max'] = float(np.max(wake_bouts)) if len(wake_bouts) > 0 else 0.0
+
+            transitions = list(zip(stage_v[:-1], stage_v[1:]))
+            trans_counts = Counter(transitions)
+            total_trans = sum(trans_counts.values())
+            trans_probs = np.clip(
+                np.array([v / total_trans for v in trans_counts.values()]), 1e-9, 1)
+            feat['transition_entropy'] = float(-np.sum(trans_probs * np.log(trans_probs)))
+
+            half = total_epochs // 2
+            feat['n3_ratio_2nd'] = float(np.mean(stage_v[half:] == 1))
+            feat['rem_ratio_1st'] = float(np.mean(stage_v[:half] == 4))
+
+            probs = np.stack([prob_n3, prob_n2, prob_n1, prob_r, prob_w], axis=1)
+            prob_max = np.max(probs, axis=1)
+            feat['stage_confidence_min'] = float(np.min(prob_max))
+            probs_clip = np.clip(probs, 1e-9, 1)
+            entropy = -np.sum(probs_clip * np.log(probs_clip), axis=1)
+            feat['stage_entropy_std'] = float(np.std(entropy))
+            feat['prob_r_mean'] = float(np.mean(prob_r))
+            feat['prob_w_mean'] = float(np.mean(prob_w))
+
+            if arousal is not None:
+                n_ar = count_events(arousal, 1)
+                feat['arousal_index'] = float(n_ar / tst_hours)
+                ar_onsets = np.where(np.diff((arousal == 1).astype(int)) == 1)[0]
+                if len(ar_onsets) > 2:
+                    intervals = np.diff(ar_onsets)
+                    mu, sigma = np.mean(intervals), np.std(intervals)
+                    feat['arousal_burstiness'] = float((sigma - mu) / (sigma + mu + 1e-9))
+                    feat['arousal_cluster_ratio'] = float(np.mean(intervals < 120))
+                    ar_epochs = (ar_onsets / 60).astype(int)
+                    ar_epochs = ar_epochs[ar_epochs < total_epochs]
+                    n_nrem_ar = int(np.sum(np.isin(stage_v[ar_epochs], [1, 2, 3])))
+                    n_rem_ar = int(np.sum(stage_v[ar_epochs] == 4))
+                    feat['rem_arousal_ratio'] = float(
+                        n_rem_ar / (n_nrem_ar + n_rem_ar + 1e-9))
+                else:
+                    feat['arousal_burstiness'] = np.nan
+                    feat['arousal_cluster_ratio'] = np.nan
+                    feat['rem_arousal_ratio'] = np.nan
+            else:
+                feat['arousal_index'] = np.nan
+                feat['arousal_burstiness'] = np.nan
+                feat['arousal_cluster_ratio'] = np.nan
+                feat['rem_arousal_ratio'] = np.nan
+
+            if resp is not None:
+                n_oa = count_events(resp, 1)
+                n_ca = count_events(resp, 2)
+                n_hy = count_events(resp, 4)
+                feat['ahi'] = float((n_oa + n_ca + n_hy) / tst_hours)
+                feat['ahi_rem'] = resp_burden_by_stage(stage_v, resp, 4, fs=resp_fs)
+                feat['ahi_nrem'] = resp_burden_by_stage(stage_v, resp, 2, fs=resp_fs)
+                feat['ahi_n3'] = resp_burden_by_stage(stage_v, resp, 1, fs=resp_fs)
+                ahi_rem = feat['ahi_rem']
+                ahi_nrem = feat['ahi_nrem']
+                if ahi_rem is not None and not np.isnan(ahi_rem):
+                    feat['ahi_rem_nrem_ratio'] = float(ahi_rem / (ahi_nrem + 0.01))
+                else:
+                    feat['ahi_rem_nrem_ratio'] = np.nan
+            else:
+                feat['ahi'] = np.nan
+                feat['ahi_rem'] = np.nan
+                feat['ahi_nrem'] = np.nan
+                feat['ahi_n3'] = np.nan
+                feat['ahi_rem_nrem_ratio'] = np.nan
+
+            return feat
+
+    except Exception:
+        return {}
+
+
+def clip_features(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+    for col, (lo, hi) in CLIP_RANGES.items():
+        if col in X.columns:
+            X[col] = X[col].clip(lower=lo, upper=hi)
+    return X
+
+
+# ── train_model ────────────────────────────────────────────
+
 def train_model(data_folder, model_folder, verbose=False):
     os.makedirs(model_folder, exist_ok=True)
 
     if verbose:
-        print('📂 데이터 로드 중...')
+        print('데이터 로드 중...')
 
     df = pd.read_csv(os.path.join(data_folder, 'demographics.csv'))
 
     if verbose:
-        print(f'✅ 환자 수: {len(df)}명')
-        print('🔄 Hybrid feature 추출 중...')
+        print(f'환자 수: {len(df)}명')
+        print('feature 추출 중... (CAISR + raw EDF)')
 
     records = []
+    n_annot = 0
+    n_raw = 0
     for _, row in df.iterrows():
-        pid      = row.get('BDSPPatientID', '')
-        feat     = {'BDSPPatientID': pid}
-        edf_path = find_annot_file(pid, data_folder)
-        if edf_path:
-            feat.update(extract_hybrid_features(edf_path))
+        bids_folder = str(row.get('BidsFolder', ''))
+        site_id = str(row.get('SiteID', ''))
+        session_id = row.get('SessionID', '')
+
+        feat = {'BidsFolder': bids_folder}
+        feat.update(extract_demo_features(row))
+
+        # CAISR annotation feature 우선, 없으면 human annotation으로 대체
+        annot_path = build_annot_path(data_folder, site_id, bids_folder, session_id)
+        if os.path.exists(annot_path):
+            n_annot += 1
+            caisr_feat = extract_caisr_features(annot_path)
+            if caisr_feat:
+                feat.update(caisr_feat)
+            else:
+                # CAISR 파싱 실패 → human annotation으로 대체
+                human_path = build_human_annot_path(data_folder, site_id, bids_folder, session_id)
+                if human_path:
+                    feat.update(extract_human_features(human_path))
+        else:
+            # CAISR 없으면 human annotation으로 대체
+            human_path = build_human_annot_path(data_folder, site_id, bids_folder, session_id)
+            if human_path:
+                feat.update(extract_human_features(human_path))
+
+        # raw EDF feature (SaO2)
+        phys_path = find_phys_file(data_folder, site_id, bids_folder, session_id)
+        if phys_path:
+            n_raw += 1
+            feat.update(extract_raw_features(phys_path))
+
         records.append(feat)
 
-    df_feat = pd.DataFrame(records)
-    df_all  = df.merge(df_feat, on='BDSPPatientID', how='left')
+    if verbose:
+        print(f'  annotation 찾은 환자: {n_annot}/{len(df)}명')
+        print(f'  raw EDF 찾은 환자: {n_raw}/{len(df)}명')
 
-    if 'Cognitive_Impairment' in df_all.columns:
-        y = df_all['Cognitive_Impairment'].astype(int)
-    else:
-        raise ValueError('라벨 컬럼을 찾을 수 없습니다.')
+    df_feat = pd.DataFrame(records)
+    df_all = df.merge(df_feat, on='BidsFolder', how='left')
+
+    df_all['Age'] = df_all['Age'].fillna(df_all['Age'].median())
+    df_all['BMI'] = df_all['BMI'].fillna(df_all['BMI'].median())
+
+    if 'Cognitive_Impairment' not in df_all.columns:
+        raise ValueError('라벨 컬럼(Cognitive_Impairment)을 찾을 수 없습니다.')
+
+    y = df_all['Cognitive_Impairment'].apply(
+        lambda v: 1 if str(v).strip().upper() == 'TRUE' or v is True else 0
+    )
 
     X = df_all[FEATURE_COLS].copy()
+    X = clip_features(X)
 
     if verbose:
-        print(f'🤖 모델 학습 중... (feature: {len(FEATURE_COLS)}개, 샘플: {len(X)}명)')
+        nan_rate = X.isna().mean().mean()
+        print(f'  feature NaN 비율: {nan_rate:.1%}')
+        print(f'  라벨 분포: {dict(y.value_counts())}')
+        print(f'모델 학습 중... (feature: {len(FEATURE_COLS)}개, 샘플: {len(X)}명)')
 
-    imputer = SimpleImputer(strategy='median')
-    X_imp   = imputer.fit_transform(X)
+    imputer = KNNImputer(n_neighbors=5)
+    X_imp = imputer.fit_transform(X)
 
-    model = RandomForestClassifier(**RF_PARAMS)
+    rf = RandomForestClassifier(**RF_PARAMS)
+    gb = GradientBoostingClassifier(**GB_PARAMS)
+
+    model = VotingClassifier(
+        estimators=[('rf', rf), ('gb', gb)],
+        voting='soft',
+        weights=[1, 1],
+    )
     model.fit(X_imp, y)
 
-    joblib.dump(model,   os.path.join(model_folder, 'momochi_model.pkl'))
+    prior = float(np.mean(y))
+
+    joblib.dump(model, os.path.join(model_folder, 'momochi_model.pkl'))
     joblib.dump(imputer, os.path.join(model_folder, 'imputer.pkl'))
     with open(os.path.join(model_folder, 'features.json'), 'w') as f:
         json.dump(FEATURE_COLS, f, indent=2)
+    with open(os.path.join(model_folder, 'prior.json'), 'w') as f:
+        json.dump({'prior': prior}, f)
+
+    # ── slim 모델 학습 (annotation 없을 때 fallback) ──────────
+    if verbose:
+        print('slim 모델 학습 중... (SaO2 + demographics만)')
+    X_slim = df_all[FEATURE_COLS_SLIM].copy()
+    X_slim = clip_features(X_slim)
+    imputer_slim = SimpleImputer(strategy='median')
+    X_slim_imp = imputer_slim.fit_transform(X_slim)
+
+    rf_slim = RandomForestClassifier(
+        n_estimators=200, max_depth=5, min_samples_leaf=12,
+        min_samples_split=20, max_features='sqrt', max_samples=0.8,
+        class_weight='balanced_subsample', random_state=42, n_jobs=-1,
+    )
+    gb_slim = GradientBoostingClassifier(
+        n_estimators=150, max_depth=3, min_samples_leaf=10,
+        learning_rate=0.05, subsample=0.8, max_features='sqrt', random_state=42,
+    )
+    model_slim = VotingClassifier(
+        estimators=[('rf', rf_slim), ('gb', gb_slim)],
+        voting='soft', weights=[1, 1],
+    )
+    model_slim.fit(X_slim_imp, y)
+
+    joblib.dump(model_slim, os.path.join(model_folder, 'momochi_model_slim.pkl'))
+    joblib.dump(imputer_slim, os.path.join(model_folder, 'imputer_slim.pkl'))
+    with open(os.path.join(model_folder, 'features_slim.json'), 'w') as f:
+        json.dump(FEATURE_COLS_SLIM, f, indent=2)
 
     if verbose:
-        print(f'💾 모델 저장 완료 → {model_folder}')
-        print('✅ 훈련 완료!')
+        print(f'  prior probability: {prior:.4f}')
+        print(f'모델 저장 완료 → {model_folder}')
+        print('훈련 완료!')
 
-# ============================================================
-# load_model
-# ============================================================
+
+# ── load_model ─────────────────────────────────────────────
+
 def load_model(model_folder, verbose=False):
-    model   = joblib.load(os.path.join(model_folder, 'momochi_model.pkl'))
+    model = joblib.load(os.path.join(model_folder, 'momochi_model.pkl'))
     imputer = joblib.load(os.path.join(model_folder, 'imputer.pkl'))
     with open(os.path.join(model_folder, 'features.json'), 'r') as f:
         features = json.load(f)
-    if verbose:
-        print('✅ 모델 로드 완료!')
-    return {'model': model, 'imputer': imputer, 'features': features}
+    prior_path = os.path.join(model_folder, 'prior.json')
+    prior = 0.5
+    if os.path.exists(prior_path):
+        with open(prior_path, 'r') as f:
+            prior = json.load(f).get('prior', 0.5)
 
-# ============================================================
-# run_model
-# ============================================================
+    # slim 모델 로드
+    model_slim = joblib.load(os.path.join(model_folder, 'momochi_model_slim.pkl'))
+    imputer_slim = joblib.load(os.path.join(model_folder, 'imputer_slim.pkl'))
+    with open(os.path.join(model_folder, 'features_slim.json'), 'r') as f:
+        features_slim = json.load(f)
+
+    if verbose:
+        print(f'모델 로드 완료! (prior={prior:.4f})')
+    return {
+        'model': model, 'imputer': imputer, 'features': features,
+        'model_slim': model_slim, 'imputer_slim': imputer_slim, 'features_slim': features_slim,
+        'prior': prior,
+    }
+
+
+# ── run_model ──────────────────────────────────────────────
+
 def run_model(model_dict, record, data_folder, verbose=False):
+    prior = float(model_dict.get('prior', 0.5))
+    bids_folder = str(record.get('BidsFolder', ''))
+
     try:
-        clf      = model_dict['model']
-        imputer  = model_dict['imputer']
+        clf = model_dict['model']
+        imputer = model_dict['imputer']
         features = model_dict['features']
 
-        patient_id = record.get('BDSPPatientID', '')
-        edf_path   = find_annot_file(patient_id, data_folder)
-        feat = {}
-        if edf_path:
-            feat = extract_hybrid_features(edf_path)
+        site_id = str(record.get('SiteID', ''))
+        session_id = record.get('SessionID', '')
 
-        row    = {col: feat.get(col, np.nan) for col in features}
-        X      = pd.DataFrame([row])[features]
-        X_imp  = imputer.transform(X)
-        prob   = float(clf.predict_proba(X_imp)[0][1])
+        # CAISR annotation feature
+        annot_path = build_annot_path(data_folder, site_id, bids_folder, session_id)
+        feat = {}
+        if os.path.exists(annot_path):
+            feat = extract_caisr_features(annot_path)
+            if not feat and verbose:
+                print(f'  [경고] {bids_folder}: annotation 파싱 실패')
+        else:
+            if verbose:
+                print(f'  [경고] {bids_folder}: annotation 없음 → raw EDF로 대체')
+
+        # raw EDF feature (항상 시도)
+        phys_path = find_phys_file(data_folder, site_id, bids_folder, session_id)
+        if phys_path:
+            raw_feat = extract_raw_features(phys_path)
+            feat.update(raw_feat)
+        elif verbose:
+            print(f'  [경고] {bids_folder}: raw EDF도 없음')
+
+        # demographics 보완
+        demo_record = dict(record)
+        if any(k not in demo_record for k in ['Age', 'BMI', 'Sex', 'Race', 'Ethnicity']):
+            demo_path = os.path.join(data_folder, 'demographics.csv')
+            if os.path.exists(demo_path):
+                df_demo = pd.read_csv(demo_path)
+                mask = (df_demo['BidsFolder'] == bids_folder) & \
+                       (df_demo['SessionID'] == session_id)
+                rows = df_demo.loc[mask]
+                if not rows.empty:
+                    demo_record.update(rows.iloc[0].to_dict())
+
+        feat.update(extract_demo_features(demo_record))
+        try:
+            feat['Age'] = float(demo_record.get('Age', np.nan))
+        except Exception:
+            feat['Age'] = np.nan
+        try:
+            feat['BMI'] = float(demo_record.get('BMI', np.nan))
+        except Exception:
+            feat['BMI'] = np.nan
+
+        # CAISR feature가 하나라도 있으면 full 모델, 없으면 slim 모델
+        caisr_cols = [col for col in features if col not in
+                      ['Age', 'BMI', 'sex_num', 'race_num', 'ethnicity_num',
+                       'sao2_mean', 'sao2_min', 'sao2_std', 'sao2_below90', 'sao2_below85', 'odi4']]
+        has_caisr = any(not np.isnan(feat.get(col, np.nan)) for col in caisr_cols)
+
+        if has_caisr:
+            # full 모델 사용
+            row = {col: feat.get(col, np.nan) for col in features}
+            X = pd.DataFrame([row])[features]
+            X = clip_features(X)
+            X_imp = imputer.transform(X)
+            prob = float(clf.predict_proba(X_imp)[0][1])
+        else:
+            # slim 모델 사용 (annotation 없을 때)
+            if verbose:
+                print(f'  [slim] {bids_folder}: annotation 없음 → slim 모델 사용')
+            clf_slim = model_dict.get('model_slim')
+            imputer_slim = model_dict.get('imputer_slim')
+            features_slim = model_dict.get('features_slim', [])
+            if clf_slim is not None:
+                row_slim = {col: feat.get(col, np.nan) for col in features_slim}
+                X_slim = pd.DataFrame([row_slim])[features_slim]
+                X_slim = clip_features(X_slim)
+                X_slim_imp = imputer_slim.transform(X_slim)
+                prob = float(clf_slim.predict_proba(X_slim_imp)[0][1])
+            else:
+                prob = prior
+
         binary = int(prob >= 0.5)
         return binary, prob
 
     except Exception as e:
         if verbose:
-            print(f'⚠️ 예측 실패: {e}')
-        return 0, 0.5
+            print(f'  [오류] {bids_folder}: 예측 실패({e}) → prior({prior:.4f}) 반환')
+        binary = int(prior >= 0.5)
+        return binary, prior
