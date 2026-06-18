@@ -8,9 +8,9 @@
 # Strategy : Age-conditioned AUROC 최적화
 #            Greedy forward selection (age-conditioned worst 기준)
 # Threshold: 0.60 (prevalence-based reward 최적화)
-# External : I0006 age-cond=0.7182 / I0002 age-cond=0.7224
-#            Worst age-conditioned AUROC = 0.7182
-#            Leaderboard 1st: 0.656
+# External development (S0001 train → I0006/I0002):
+#   I0006 age-cond=0.7182 / I0002 age-cond=0.7224
+#   Worst age-conditioned AUROC = 0.7182
 # ============================================================
 
 import joblib
@@ -273,11 +273,13 @@ def train_model(data_folder, model_folder, verbose=False):
             cap = df[col].quantile(q)
             df[col] = df[col].clip(upper=cap)
 
-    # Training data median imputation
+    # Training data median imputation (NaN fallback 추가)
     impute_vals = {}
     for col in FEATURE_COLS:
         if col in df.columns:
             med = df[col].median()
+            if not np.isfinite(med):
+                med = 0.0
             impute_vals[col] = float(med)
             df[col] = df[col].fillna(med)
 
