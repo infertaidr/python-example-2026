@@ -3,13 +3,14 @@
 # ============================================================
 # PhysioNet Challenge 2026 | Team: Momochi-SleepAI
 #
-# Model    : RandomForestClassifier
-# Features : 24개 (Demographics + CAISR sleep/event features)
-#            sex_male 제외 (site별 방향성 불일치로 제거)
-# Strategy : Site-consistent feature selection
+# Model    : LogisticRegression
+# Features : 12개 (CAISR sleep/event features, age 제외)
+# Strategy : Age-conditioned AUROC 최적화
+#            Greedy forward selection 기반 feature 선택
 # CV       : S0001 internal 5-fold + I0006/I0002 external
-# External : I0006 AUROC=0.7815 / I0002 AUROC=0.7155
-#            Worst-site AUROC=0.7155
+# External : I0006 age-cond=0.7188 / I0002 age-cond=0.7129
+#            Worst age-conditioned AUROC = 0.7129
+#            Leaderboard 1st: 0.656
 # ============================================================
 
 import joblib
@@ -26,23 +27,15 @@ warnings.filterwarnings('ignore')
 # 확정 feature 목록 (순서 고정 - 변경 금지)
 # ============================================================
 FEATURE_COLS = [
-    'age', 'age_group_65plus', 'ethnicity_hispanic',
-    'tst_min', 'tib_min', 'sleep_eff', 'waso_min',
-    'sleep_ineff', 'waso_pct',
-    'pct_n3', 'pct_n2', 'pct_rem', 'pct_nrem',
-    'stage_entropy', 'rem_latency_min', 'n3_front_loading_ratio',
-    'n_ma', 'n_rera',
-    'n_arousals', 'arousal_rem_pct',
-    'n_plm', 'n_ilm', 'plm_index', 'event_burden'
+    'n_ma', 'n_arousals', 'pct_rem', 'pct_nrem', 'pct_n2',
+    'n_ilm', 'stage_entropy', 'n_plm', 'plm_index',
+    'stage_transition_rate', 'waso_min', 'sleep_ineff'
 ]
 
-RF_PARAMS = {
-    'n_estimators':     200,
-    'max_depth':        6,
-    'min_samples_leaf': 5,
-    'class_weight':     'balanced',
-    'random_state':     42,
-    'n_jobs':           -1,
+LR_PARAMS = {
+    'class_weight': 'balanced',
+    'max_iter':     1000,
+    'random_state': 42,
 }
 
 # ============================================================
@@ -145,12 +138,10 @@ def extract_caisr_features(edf_path):
             n_sleep = int(np.sum(valid != 5))
             n_wake  = int(np.sum(valid == 5))
             half    = n_ep // 2
-            f['tst_min']         = round(n_sleep * 30/60, 2)
-            f['tib_min']         = round(n_ep * 30/60, 2)
-            f['sleep_eff']       = round(n_sleep/n_ep*100, 2)
-            f['waso_min']        = round(n_wake * 30/60, 2)
-            f['sleep_onset_min'] = round(
-                np.argmax(valid!=5)*30/60 if n_sleep>0 else n_ep*30/60, 2)
+            f['tst_min']   = round(n_sleep * 30/60, 2)
+            f['tib_min']   = round(n_ep * 30/60, 2)
+            f['sleep_eff'] = round(n_sleep/n_ep*100, 2)
+            f['waso_min']  = round(n_wake * 30/60, 2)
             f['sleep_ineff'] = round(100.0 - f['sleep_eff'], 2)
             f['waso_pct']    = round(f['waso_min']/(f['tib_min']+1e-4)*100, 2)
             if n_sleep > 0:
@@ -172,18 +163,16 @@ def extract_caisr_features(edf_path):
                 f['n3_front_loading_ratio'] = round(
                     (np.sum(valid[:half]==1)+1e-4)/
                     (np.sum(valid[half:]==1)+1e-4), 4)
-                f['n3_rem_ratio'] = round(
-                    float(np.sum(valid==1))/(float(np.sum(valid==4))+1e-4), 4)
             else:
                 for k in ['pct_n3','pct_n2','pct_n1','pct_rem','pct_nrem',
-                          'stage_transition_rate','stage_entropy','rem_latency_min',
-                          'n3_front_loading_ratio','n3_rem_ratio']:
+                          'stage_transition_rate','stage_entropy',
+                          'rem_latency_min','n3_front_loading_ratio']:
                     f[k] = np.nan
         else:
-            for k in ['tst_min','tib_min','sleep_eff','waso_min','sleep_onset_min',
-                      'sleep_ineff','waso_pct','pct_n3','pct_n2','pct_n1','pct_rem',
-                      'pct_nrem','stage_transition_rate','stage_entropy',
-                      'rem_latency_min','n3_front_loading_ratio','n3_rem_ratio']:
+            for k in ['tst_min','tib_min','sleep_eff','waso_min','sleep_ineff',
+                      'waso_pct','pct_n3','pct_n2','pct_n1','pct_rem','pct_nrem',
+                      'stage_transition_rate','stage_entropy',
+                      'rem_latency_min','n3_front_loading_ratio']:
                 f[k] = np.nan
 
     # Respiratory
@@ -245,7 +234,7 @@ def extract_caisr_features(edf_path):
     else:
         f['n_plm']=f['n_ilm']=f['plm_index']=np.nan
 
-    # event_burden 맨 마지막에 계산
+    # event_burden 맨 마지막
     f['event_burden'] = round(
         (0 if np.isnan(f.get('ahi', np.nan)) else f.get('ahi', 0)) +
         (0 if np.isnan(f.get('arousal_index', np.nan)) else f.get('arousal_index', 0)) +
@@ -258,7 +247,7 @@ def extract_caisr_features(edf_path):
 # ============================================================
 def train_model(data_folder, model_folder, verbose=False):
     import pandas as pd
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
 
     os.makedirs(model_folder, exist_ok=True)
     if verbose:
@@ -269,10 +258,6 @@ def train_model(data_folder, model_folder, verbose=False):
         demo['Cognitive_Impairment'] = demo['Cognitive_Impairment'].map(
             {'TRUE':True,'True':True,'true':True,
              'FALSE':False,'False':False,'false':False})
-
-    demo['age']                = demo['Age'].apply(lambda x: safe_float(x))
-    demo['age_group_65plus']   = (demo['age'] >= 65).astype(int)
-    demo['ethnicity_hispanic'] = (demo['Ethnicity'].str.strip().str.lower()=='hispanic').astype(int)
 
     if verbose:
         print(f'Extracting CAISR features for {len(demo)} patients...')
@@ -287,18 +272,16 @@ def train_model(data_folder, model_folder, verbose=False):
             print(f'  [{i+1}/{len(demo)}]')
 
     caisr_df = pd.DataFrame(records)
-    df = demo[['BDSPPatientID','age','age_group_65plus',
-               'ethnicity_hispanic','Cognitive_Impairment']].merge(
+    df = demo[['BDSPPatientID','Cognitive_Impairment']].merge(
         caisr_df, on='BDSPPatientID', how='left')
 
     # Winsorize
-    for col, q in [('ahi',0.99),('rdi',0.99),('n_ilm',0.99),
-                   ('plm_index',0.99),('n_plm',0.99),('event_burden',0.99)]:
+    for col, q in [('n_ilm',0.99),('n_plm',0.99),('plm_index',0.99)]:
         if col in df.columns:
             cap = df[col].quantile(q)
             df[col] = df[col].clip(upper=cap)
 
-    # Training data 기준 median imputation
+    # Training data median imputation
     impute_vals = {}
     for col in FEATURE_COLS:
         if col in df.columns:
@@ -310,9 +293,9 @@ def train_model(data_folder, model_folder, verbose=False):
     y = df['Cognitive_Impairment'].astype(int).values
 
     if verbose:
-        print(f'Training RF... (n={len(X)}, CI={y.sum()})')
+        print(f'Training LR... (n={len(X)}, CI={y.sum()})')
 
-    model = RandomForestClassifier(**RF_PARAMS)
+    model = LogisticRegression(**LR_PARAMS)
     model.fit(X, y)
 
     joblib.dump(model, os.path.join(model_folder, 'model.pkl'))
@@ -349,12 +332,6 @@ def run_model(model_dict, record, data_folder, verbose=False):
         patient_id = record.get('BDSPPatientID', '')
         edf_path   = find_annot_file(patient_id, data_folder)
         feat       = extract_caisr_features(edf_path) if edf_path else {}
-
-        # Demographics (safe_float 사용)
-        age = safe_float(record.get('Age', np.nan))
-        feat['age']                = age
-        feat['age_group_65plus']   = 1 if (not np.isnan(age) and age >= 65) else 0
-        feat['ethnicity_hispanic'] = 1 if str(record.get('Ethnicity','')).strip().lower()=='hispanic' else 0
 
         # Feature vector with imputation
         feat_vec = []
