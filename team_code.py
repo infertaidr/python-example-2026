@@ -3,13 +3,13 @@
 # ============================================================
 # PhysioNet Challenge 2026 | Team: Momochi-SleepAI
 #
-# Model    : LogisticRegression
+# Model    : LogisticRegression + StandardScaler
 # Features : 12개 (CAISR sleep/event features, age 제외)
 # Strategy : Age-conditioned AUROC 최적화
-#            Greedy forward selection 기반 feature 선택
-# CV       : S0001 internal 5-fold + I0006/I0002 external
-# External : I0006 age-cond=0.7188 / I0002 age-cond=0.7129
-#            Worst age-conditioned AUROC = 0.7129
+#            Greedy forward selection (age-conditioned worst 기준)
+# Threshold: 0.60 (prevalence-based reward 최적화)
+# External : I0006 age-cond=0.7182 / I0002 age-cond=0.7224
+#            Worst age-conditioned AUROC = 0.7182
 #            Leaderboard 1st: 0.656
 # ============================================================
 
@@ -32,11 +32,7 @@ FEATURE_COLS = [
     'stage_transition_rate', 'waso_min', 'sleep_ineff'
 ]
 
-LR_PARAMS = {
-    'class_weight': 'balanced',
-    'max_iter':     1000,
-    'random_state': 42,
-}
+THRESHOLD = 0.60
 
 # ============================================================
 # 유틸 함수
@@ -137,11 +133,10 @@ def extract_caisr_features(edf_path):
         if n_ep > 0:
             n_sleep = int(np.sum(valid != 5))
             n_wake  = int(np.sum(valid == 5))
-            half    = n_ep // 2
-            f['tst_min']   = round(n_sleep * 30/60, 2)
-            f['tib_min']   = round(n_ep * 30/60, 2)
-            f['sleep_eff'] = round(n_sleep/n_ep*100, 2)
-            f['waso_min']  = round(n_wake * 30/60, 2)
+            f['tst_min']     = round(n_sleep * 30/60, 2)
+            f['tib_min']     = round(n_ep * 30/60, 2)
+            f['sleep_eff']   = round(n_sleep/n_ep*100, 2)
+            f['waso_min']    = round(n_wake * 30/60, 2)
             f['sleep_ineff'] = round(100.0 - f['sleep_eff'], 2)
             f['waso_pct']    = round(f['waso_min']/(f['tib_min']+1e-4)*100, 2)
             if n_sleep > 0:
@@ -160,19 +155,14 @@ def extract_caisr_features(edf_path):
                 rem_idx = np.where(valid==4)[0]
                 f['rem_latency_min'] = round(
                     rem_idx[0]*30/60 if len(rem_idx)>0 else n_ep*30/60, 2)
-                f['n3_front_loading_ratio'] = round(
-                    (np.sum(valid[:half]==1)+1e-4)/
-                    (np.sum(valid[half:]==1)+1e-4), 4)
             else:
                 for k in ['pct_n3','pct_n2','pct_n1','pct_rem','pct_nrem',
-                          'stage_transition_rate','stage_entropy',
-                          'rem_latency_min','n3_front_loading_ratio']:
+                          'stage_transition_rate','stage_entropy','rem_latency_min']:
                     f[k] = np.nan
         else:
             for k in ['tst_min','tib_min','sleep_eff','waso_min','sleep_ineff',
                       'waso_pct','pct_n3','pct_n2','pct_n1','pct_rem','pct_nrem',
-                      'stage_transition_rate','stage_entropy',
-                      'rem_latency_min','n3_front_loading_ratio']:
+                      'stage_transition_rate','stage_entropy','rem_latency_min']:
                 f[k] = np.nan
 
     # Respiratory
@@ -248,6 +238,8 @@ def extract_caisr_features(edf_path):
 def train_model(data_folder, model_folder, verbose=False):
     import pandas as pd
     from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
 
     os.makedirs(model_folder, exist_ok=True)
     if verbose:
@@ -293,9 +285,13 @@ def train_model(data_folder, model_folder, verbose=False):
     y = df['Cognitive_Impairment'].astype(int).values
 
     if verbose:
-        print(f'Training LR... (n={len(X)}, CI={y.sum()})')
+        print(f'Training LR+Scaler... (n={len(X)}, CI={y.sum()})')
 
-    model = LogisticRegression(**LR_PARAMS)
+    model = Pipeline([
+        ('scaler', StandardScaler()),
+        ('clf', LogisticRegression(
+            class_weight='balanced', max_iter=1000, random_state=42))
+    ])
     model.fit(X, y)
 
     joblib.dump(model, os.path.join(model_folder, 'model.pkl'))
@@ -303,6 +299,8 @@ def train_model(data_folder, model_folder, verbose=False):
         json.dump(FEATURE_COLS, fj)
     with open(os.path.join(model_folder, 'impute_vals.json'), 'w') as fj:
         json.dump(impute_vals, fj)
+    with open(os.path.join(model_folder, 'threshold.json'), 'w') as fj:
+        json.dump({'threshold': THRESHOLD}, fj)
 
     if verbose:
         print('Model saved!')
@@ -316,9 +314,14 @@ def load_model(model_folder, verbose=False):
         features = json.load(f)
     with open(os.path.join(model_folder, 'impute_vals.json')) as f:
         impute_vals = json.load(f)
+    threshold = THRESHOLD
+    if os.path.exists(os.path.join(model_folder, 'threshold.json')):
+        with open(os.path.join(model_folder, 'threshold.json')) as f:
+            threshold = json.load(f)['threshold']
     if verbose:
-        print('Model loaded!')
-    return {'model': model, 'features': features, 'impute_vals': impute_vals}
+        print(f'Model loaded! threshold={threshold}')
+    return {'model': model, 'features': features,
+            'impute_vals': impute_vals, 'threshold': threshold}
 
 # ============================================================
 # run_model
@@ -328,6 +331,7 @@ def run_model(model_dict, record, data_folder, verbose=False):
         clf         = model_dict['model']
         features    = model_dict['features']
         impute_vals = model_dict['impute_vals']
+        threshold   = model_dict.get('threshold', THRESHOLD)
 
         patient_id = record.get('BDSPPatientID', '')
         edf_path   = find_annot_file(patient_id, data_folder)
@@ -342,7 +346,7 @@ def run_model(model_dict, record, data_folder, verbose=False):
             feat_vec.append(float(v))
 
         prob   = float(clf.predict_proba([feat_vec])[0][1])
-        binary = int(prob >= 0.5)
+        binary = int(prob >= threshold)
         return binary, prob
 
     except Exception as e:
