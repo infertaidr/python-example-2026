@@ -11,6 +11,12 @@
 # External development (S0001 train → I0006/I0002):
 #   I0006 age-cond=0.7182 / I0002 age-cond=0.7224
 #   Worst age-conditioned AUROC = 0.7182
+#
+# v1.1 FIX: run_model()이 받는 record는 BidsFolder/SiteID/SessionID만
+#           가지고 있고 BDSPPatientID는 없음을 확인. annotation file
+#           매칭을 BidsFolder+SessionID 기반 정확 매칭으로 수정.
+#           (v1에서 patient_id가 빈 문자열로 처리되어 모든 환자가
+#            동일 annotation을 사용하는 버그가 있었음 -> age-cond AUROC 0.500)
 # ============================================================
 
 import joblib
@@ -46,6 +52,18 @@ def safe_float(x, default=np.nan):
         return float(x)
     except:
         return default
+
+def normalize_session_id(session_id):
+    """1, 1.0, '1', '1.0' 등 다양한 형태를 '1'로 통일"""
+    try:
+        if isinstance(session_id, float) and session_id.is_integer():
+            return str(int(session_id))
+        s = str(session_id).strip()
+        if s.endswith('.0'):
+            s = s[:-2]
+        return s
+    except:
+        return str(session_id)
 
 def get_native_sfreq(raw, ch_name):
     try:
@@ -96,11 +114,66 @@ def get_event_data(raw, ch_name):
         data = np.round(raw_data).astype(int)
     return data, native_sfreq
 
-def find_annot_file(patient_id, data_folder):
+# ============================================================
+# Annotation file 탐색 (BidsFolder + SessionID + SiteID 기반)
+# ============================================================
+def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
+    """
+    record = {'BidsFolder':..., 'SiteID':..., 'SessionID':...} 형태에서
+    정확한 annotation EDF 파일을 찾는다.
+    파일명 패턴: {BidsFolder}_ses-{SessionID}_caisr_annotations.edf
+    """
+    annot_base = os.path.join(data_folder, 'algorithmic_annotations')
+    if not os.path.isdir(annot_base):
+        return None
+
+    bids_folder = str(bids_folder).strip() if bids_folder is not None else ''
+    session_id  = normalize_session_id(session_id)
+    site_id     = str(site_id).strip() if site_id is not None else ''
+
+    if not bids_folder or not session_id:
+        return None
+
+    target_name = f"{bids_folder}_ses-{session_id}_caisr_annotations.edf"
+
+    # 1) SiteID 폴더 직접 확인 (가장 빠르고 안전)
+    if site_id:
+        site_path = os.path.join(annot_base, site_id)
+        candidate = os.path.join(site_path, target_name)
+        if os.path.exists(candidate):
+            return candidate
+
+    # 2) 모든 site 폴더에서 정확 파일명 확인
+    for site_folder in os.listdir(annot_base):
+        site_path = os.path.join(annot_base, site_folder)
+        if not os.path.isdir(site_path):
+            continue
+        candidate = os.path.join(site_path, target_name)
+        if os.path.exists(candidate):
+            return candidate
+
+    # 3) fallback: bids_folder와 ses-{session_id}가 둘 다 포함된 caisr 파일
+    for root, _, files in os.walk(annot_base):
+        for fname in files:
+            if (fname.endswith('.edf')
+                    and bids_folder in fname
+                    and f"ses-{session_id}" in fname
+                    and "caisr" in fname.lower()):
+                return os.path.join(root, fname)
+
+    return None
+
+def find_annot_file_train(patient_id, data_folder):
+    """
+    train_model()에서 demographics.csv 전체를 순회할 때 사용.
+    demographics.csv에는 BDSPPatientID가 있으므로 substring 매칭이 안전하게 동작.
+    """
     annot_base = os.path.join(data_folder, 'algorithmic_annotations')
     if not os.path.exists(annot_base):
         return None
-    pid_str = str(patient_id)
+    pid_str = str(patient_id).strip()
+    if not pid_str:
+        return None
     for site_folder in os.listdir(annot_base):
         site_path = os.path.join(annot_base, site_folder)
         if not os.path.isdir(site_path):
@@ -256,7 +329,7 @@ def train_model(data_folder, model_folder, verbose=False):
 
     records = []
     for i, (_, row) in enumerate(demo.iterrows()):
-        edf_path = find_annot_file(row['BDSPPatientID'], data_folder)
+        edf_path = find_annot_file_train(row['BDSPPatientID'], data_folder)
         feats    = extract_caisr_features(edf_path)
         feats['BDSPPatientID'] = row['BDSPPatientID']
         records.append(feats)
@@ -273,7 +346,7 @@ def train_model(data_folder, model_folder, verbose=False):
             cap = df[col].quantile(q)
             df[col] = df[col].clip(upper=cap)
 
-    # Training data median imputation (NaN fallback 추가)
+    # Training data median imputation (NaN fallback 포함)
     impute_vals = {}
     for col in FEATURE_COLS:
         if col in df.columns:
@@ -335,9 +408,14 @@ def run_model(model_dict, record, data_folder, verbose=False):
         impute_vals = model_dict['impute_vals']
         threshold   = model_dict.get('threshold', THRESHOLD)
 
-        patient_id = record.get('BDSPPatientID', '')
-        edf_path   = find_annot_file(patient_id, data_folder)
-        feat       = extract_caisr_features(edf_path) if edf_path else {}
+        # record = {'BidsFolder':..., 'SiteID':..., 'SessionID':...}
+        # (BDSPPatientID는 record에 없음! BidsFolder 기반으로 식별해야 함)
+        bids_folder = record.get('BidsFolder', '')
+        site_id     = record.get('SiteID', '')
+        session_id  = record.get('SessionID', '')
+
+        edf_path = find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder)
+        feat = extract_caisr_features(edf_path) if edf_path else {}
 
         # Feature vector with imputation
         feat_vec = []
