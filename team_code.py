@@ -4,19 +4,28 @@
 # PhysioNet Challenge 2026 | Team: Momochi-SleepAI
 #
 # Model    : LogisticRegression + StandardScaler
-# Features : 12개 (CAISR sleep/event features, age 제외)
-# Strategy : Age-conditioned AUROC 최적화
-#            Greedy forward selection (age-conditioned worst 기준)
-# Threshold: 0.60 (prevalence-based reward 최적화)
-# External development (S0001 train → I0006/I0002):
-#   I0006 age-cond=0.7182 / I0002 age-cond=0.7224
-#   Worst age-conditioned AUROC = 0.7182
+# Features : 11개 (rate-normalized CAISR sleep/event features)
+# Strategy : raw event counts -> per-hour rate -> log1p transform
+#            (v1.1의 raw count feature가 site-dependent scale에
+#             민감할 수 있다는 가설을 검증하여 확인됨)
+# Threshold: 0.58 (prevalence-based reward 최적화, plateau 확인됨)
 #
-# v1.1 FIX: run_model()이 받는 record는 BidsFolder/SiteID/SessionID만
-#           가지고 있고 BDSPPatientID는 없음을 확인. annotation file
-#           매칭을 BidsFolder+SessionID 기반 정확 매칭으로 수정.
-#           (v1에서 patient_id가 빈 문자열로 처리되어 모든 환자가
-#            동일 annotation을 사용하는 버그가 있었음 -> age-cond AUROC 0.500)
+# Version history:
+#   v1   : run_model()에서 BDSPPatientID로 환자 식별 -> hidden에서
+#          record에 BDSPPatientID가 없어 전부 동일 annotation 매칭 버그.
+#          Age-cond AUROC=0.500, Reward=0.008
+#   v1.1 : run_model() 식별자를 BidsFolder+SiteID+SessionID로 수정.
+#          12개 raw-count CAISR feature, threshold=0.60.
+#          Age-cond AUROC=0.584, Reward=0.021 (hidden 실측)
+#   v2   : raw event count(n_ma, n_arousals, n_ilm)를 TST 기준
+#          per-hour rate로 변환 후 log1p 적용. n_plm 제거(plm_index와
+#          redundant). LOSO 검증 결과 모든 메인 지표에서 v1.1 대비 개선:
+#            I0006 age-cond : 0.7180 -> 0.7345
+#            I0002 age-cond : 0.7230 -> 0.7346
+#            site gap       : 0.0050 -> 0.0001
+#            reward proxy   : 0.2779 -> 0.3148 (threshold=0.58 기준)
+#          Threshold도 0.60 -> 0.58로 재조정 (worst-site reward 최적화,
+#          0.56~0.59 plateau 구간 확인되어 안정적인 지점으로 선택)
 # ============================================================
 
 import joblib
@@ -33,12 +42,12 @@ warnings.filterwarnings('ignore')
 # 확정 feature 목록 (순서 고정 - 변경 금지)
 # ============================================================
 FEATURE_COLS = [
-    'n_ma', 'n_arousals', 'pct_rem', 'pct_nrem', 'pct_n2',
-    'n_ilm', 'stage_entropy', 'n_plm', 'plm_index',
+    'log_ma_index', 'log_arousal_index', 'pct_rem', 'pct_nrem', 'pct_n2',
+    'log_ilm_index', 'stage_entropy', 'plm_index',
     'stage_transition_rate', 'waso_min', 'sleep_ineff'
 ]
 
-THRESHOLD = 0.60
+THRESHOLD = 0.58
 
 # ============================================================
 # 유틸 함수
@@ -115,13 +124,13 @@ def get_event_data(raw, ch_name):
     return data, native_sfreq
 
 # ============================================================
-# Annotation file 탐색 (BidsFolder + SessionID + SiteID 기반)
+# Annotation file 탐색 (v1.1과 동일 - BidsFolder 기반)
 # ============================================================
 def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
     """
-    record = {'BidsFolder':..., 'SiteID':..., 'SessionID':...} 형태에서
-    정확한 annotation EDF 파일을 찾는다.
-    파일명 패턴: {BidsFolder}_ses-{SessionID}_caisr_annotations.edf
+    run_model()용. record = {'BidsFolder':..., 'SiteID':..., 'SessionID':...}
+    BDSPPatientID는 record에 없음. 파일명 패턴:
+    {BidsFolder}_ses-{SessionID}_caisr_annotations.edf
     """
     annot_base = os.path.join(data_folder, 'algorithmic_annotations')
     if not os.path.isdir(annot_base):
@@ -136,14 +145,11 @@ def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
 
     target_name = f"{bids_folder}_ses-{session_id}_caisr_annotations.edf"
 
-    # 1) SiteID 폴더 직접 확인 (가장 빠르고 안전)
     if site_id:
-        site_path = os.path.join(annot_base, site_id)
-        candidate = os.path.join(site_path, target_name)
+        candidate = os.path.join(annot_base, site_id, target_name)
         if os.path.exists(candidate):
             return candidate
 
-    # 2) 모든 site 폴더에서 정확 파일명 확인
     for site_folder in os.listdir(annot_base):
         site_path = os.path.join(annot_base, site_folder)
         if not os.path.isdir(site_path):
@@ -152,7 +158,6 @@ def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
         if os.path.exists(candidate):
             return candidate
 
-    # 3) fallback: bids_folder와 ses-{session_id}가 둘 다 포함된 caisr 파일
     for root, _, files in os.walk(annot_base):
         for fname in files:
             if (fname.endswith('.edf')
@@ -160,14 +165,10 @@ def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
                     and f"ses-{session_id}" in fname
                     and "caisr" in fname.lower()):
                 return os.path.join(root, fname)
-
     return None
 
 def find_annot_file_train(patient_id, data_folder):
-    """
-    train_model()에서 demographics.csv 전체를 순회할 때 사용.
-    demographics.csv에는 BDSPPatientID가 있으므로 substring 매칭이 안전하게 동작.
-    """
+    """train_model()용. demographics.csv에는 BDSPPatientID가 항상 존재."""
     annot_base = os.path.join(data_folder, 'algorithmic_annotations')
     if not os.path.exists(annot_base):
         return None
@@ -184,7 +185,7 @@ def find_annot_file_train(patient_id, data_folder):
     return None
 
 # ============================================================
-# CAISR feature 추출
+# CAISR feature 추출 (raw count + rate-normalized 둘 다 계산)
 # ============================================================
 def extract_caisr_features(edf_path):
     if not edf_path or not os.path.exists(edf_path):
@@ -238,53 +239,29 @@ def extract_caisr_features(edf_path):
                       'stage_transition_rate','stage_entropy','rem_latency_min']:
                 f[k] = np.nan
 
-    # Respiratory
+    # Respiratory (raw count - n_ma만 v2 feature로 변환됨)
     resp_ch = find_channel(raw, ['resp','caisr'], exclude=['prob'])
     if resp_ch and not np.isnan(f.get('tst_min', np.nan)):
         resp_data, _ = get_event_data(raw, resp_ch)
-        tst_h = f['tst_min'] / 60
         def cnt(vals):
             return count_events(np.isin(resp_data, vals).astype(int))
         n_oa,n_ca,n_ma,n_hy,n_rera = cnt([1]),cnt([2]),cnt([3]),cnt([4]),cnt([5])
-        n_ap = n_oa+n_ca+n_ma
         f['n_oa']=n_oa; f['n_ca']=n_ca; f['n_ma']=n_ma
         f['n_hy']=n_hy; f['n_rera']=n_rera
-        f['ahi'] = round((n_ap+n_hy)/tst_h,3)        if tst_h>0 else np.nan
-        f['rdi'] = round((n_ap+n_hy+n_rera)/tst_h,3) if tst_h>0 else np.nan
-        f['pct_oa'] = round(n_oa/n_ap*100,2) if n_ap>0 else 0.0
-        f['pct_ca'] = round(n_ca/n_ap*100,2) if n_ap>0 else 0.0
     else:
-        for k in ['n_oa','n_ca','n_ma','n_hy','n_rera','ahi','rdi','pct_oa','pct_ca']:
+        for k in ['n_oa','n_ca','n_ma','n_hy','n_rera']:
             f[k] = np.nan
 
-    # Arousal
+    # Arousal (raw count - n_arousals만 v2 feature로 변환됨)
     arou_ch = find_channel(raw, ['arousal','caisr'], exclude=['prob'])
     if arou_ch and not np.isnan(f.get('tst_min', np.nan)):
         arou_data, arou_sfreq = get_event_data(raw, arou_ch)
-        tst_h = f['tst_min'] / 60
-        n_ar  = count_events(arou_data)
-        f['n_arousals']    = n_ar
-        f['arousal_index'] = round(n_ar/tst_h,3) if tst_h>0 else np.nan
-        if valid_epochs is not None and int(np.sum(valid_epochs==4)) > 0:
-            try:
-                rem_mask = (valid_epochs==4)
-                spe      = max(int(round(30*arou_sfreq)),1)
-                n_ep2    = min(len(rem_mask), len(arou_data)//spe)
-                rem_ar   = 0
-                for ei in range(n_ep2):
-                    seg = arou_data[ei*spe:(ei+1)*spe]
-                    if ei < len(rem_mask) and rem_mask[ei]:
-                        rem_ar += count_events(seg)
-                f['arousal_rem_pct'] = round(rem_ar/n_ar*100,2) if n_ar>0 else 0.0
-            except:
-                f['arousal_rem_pct'] = np.nan
-        else:
-            f['arousal_rem_pct'] = 0.0
+        n_ar = count_events(arou_data)
+        f['n_arousals'] = n_ar
     else:
-        for k in ['n_arousals','arousal_index','arousal_rem_pct']:
-            f[k] = np.nan
+        f['n_arousals'] = np.nan
 
-    # Limb
+    # Limb (raw count n_ilm -> v2 feature, plm_index는 rate 그대로 사용)
     limb_ch = find_channel(raw, ['limb','caisr'], exclude=['prob'])
     if limb_ch and not np.isnan(f.get('tst_min', np.nan)):
         limb_data, _ = get_event_data(raw, limb_ch)
@@ -297,11 +274,20 @@ def extract_caisr_features(edf_path):
     else:
         f['n_plm']=f['n_ilm']=f['plm_index']=np.nan
 
-    # event_burden 맨 마지막
-    f['event_burden'] = round(
-        (0 if np.isnan(f.get('ahi', np.nan)) else f.get('ahi', 0)) +
-        (0 if np.isnan(f.get('arousal_index', np.nan)) else f.get('arousal_index', 0)) +
-        (0 if np.isnan(f.get('plm_index', np.nan)) else f.get('plm_index', 0)), 3)
+    # ── v2: raw count -> TST 기준 per-hour rate -> log1p ──────────
+    tst_hours = max(f.get('tst_min', np.nan)/60.0, 1e-6) \
+        if not np.isnan(f.get('tst_min', np.nan)) else np.nan
+
+    if not np.isnan(tst_hours) and tst_hours > 0.1:
+        ma_idx       = f.get('n_ma', np.nan) / tst_hours if not np.isnan(f.get('n_ma', np.nan)) else np.nan
+        arousal_idx  = f.get('n_arousals', np.nan) / tst_hours if not np.isnan(f.get('n_arousals', np.nan)) else np.nan
+        ilm_idx      = f.get('n_ilm', np.nan) / tst_hours if not np.isnan(f.get('n_ilm', np.nan)) else np.nan
+    else:
+        ma_idx = arousal_idx = ilm_idx = np.nan
+
+    f['log_ma_index']      = round(float(np.log1p(ma_idx)), 4) if not np.isnan(ma_idx) else np.nan
+    f['log_arousal_index'] = round(float(np.log1p(arousal_idx)), 4) if not np.isnan(arousal_idx) else np.nan
+    f['log_ilm_index']     = round(float(np.log1p(ilm_idx)), 4) if not np.isnan(ilm_idx) else np.nan
 
     return f
 
@@ -340,11 +326,10 @@ def train_model(data_folder, model_folder, verbose=False):
     df = demo[['BDSPPatientID','Cognitive_Impairment']].merge(
         caisr_df, on='BDSPPatientID', how='left')
 
-    # Winsorize
-    for col, q in [('n_ilm',0.99),('n_plm',0.99),('plm_index',0.99)]:
-        if col in df.columns:
-            cap = df[col].quantile(q)
-            df[col] = df[col].clip(upper=cap)
+    # plm_index winsorize (n_ilm은 log1p로 이미 변환됐으므로 극단값 영향 적음)
+    if 'plm_index' in df.columns:
+        cap = df['plm_index'].quantile(0.99)
+        df['plm_index'] = df['plm_index'].clip(upper=cap)
 
     # Training data median imputation (NaN fallback 포함)
     impute_vals = {}
@@ -409,7 +394,6 @@ def run_model(model_dict, record, data_folder, verbose=False):
         threshold   = model_dict.get('threshold', THRESHOLD)
 
         # record = {'BidsFolder':..., 'SiteID':..., 'SessionID':...}
-        # (BDSPPatientID는 record에 없음! BidsFolder 기반으로 식별해야 함)
         bids_folder = record.get('BidsFolder', '')
         site_id     = record.get('SiteID', '')
         session_id  = record.get('SessionID', '')
@@ -417,7 +401,6 @@ def run_model(model_dict, record, data_folder, verbose=False):
         edf_path = find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder)
         feat = extract_caisr_features(edf_path) if edf_path else {}
 
-        # Feature vector with imputation
         feat_vec = []
         for col in features:
             v = feat.get(col, np.nan)
