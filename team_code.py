@@ -4,28 +4,33 @@
 # PhysioNet Challenge 2026 | Team: Momochi-SleepAI
 #
 # Model    : LogisticRegression + StandardScaler
-# Features : 11개 (rate-normalized CAISR sleep/event features)
-# Strategy : raw event counts -> per-hour rate -> log1p transform
-#            (v1.1의 raw count feature가 site-dependent scale에
-#             민감할 수 있다는 가설을 검증하여 확인됨)
-# Threshold: 0.58 (prevalence-based reward 최적화, plateau 확인됨)
+# Features : 13개 (CAISR rate-normalized 10개 + sparse EEG 3개)
+# Strategy : v2(rate-normalized CAISR)에 sparse-window EEG spectral
+#            feature를 추가. raw EEG 전체를 읽지 않고 deterministic
+#            sparse window(16 x 30초, 10~90% 위치)만 읽어 runtime을
+#            CAISR 수준으로 유지하면서 EEG 정보를 반영.
+# Threshold: 0.63 (prevalence-based reward 최적화, plateau 확인됨)
 #
 # Version history:
-#   v1   : run_model()에서 BDSPPatientID로 환자 식별 -> hidden에서
-#          record에 BDSPPatientID가 없어 전부 동일 annotation 매칭 버그.
-#          Age-cond AUROC=0.500, Reward=0.008
-#   v1.1 : run_model() 식별자를 BidsFolder+SiteID+SessionID로 수정.
-#          12개 raw-count CAISR feature, threshold=0.60.
-#          Age-cond AUROC=0.584, Reward=0.021 (hidden 실측)
-#   v2   : raw event count(n_ma, n_arousals, n_ilm)를 TST 기준
-#          per-hour rate로 변환 후 log1p 적용. n_plm 제거(plm_index와
-#          redundant). LOSO 검증 결과 모든 메인 지표에서 v1.1 대비 개선:
-#            I0006 age-cond : 0.7180 -> 0.7345
-#            I0002 age-cond : 0.7230 -> 0.7346
-#            site gap       : 0.0050 -> 0.0001
-#            reward proxy   : 0.2779 -> 0.3148 (threshold=0.58 기준)
-#          Threshold도 0.60 -> 0.58로 재조정 (worst-site reward 최적화,
-#          0.56~0.59 plateau 구간 확인되어 안정적인 지점으로 선택)
+#   v1   : run_model()에서 BDSPPatientID로 환자 식별 -> hidden record에
+#          BDSPPatientID가 없어 매칭 실패 버그. Age-cond AUROC=0.500
+#   v1.1 : BidsFolder+SiteID+SessionID 기반 매칭으로 수정.
+#          12개 raw-count CAISR feature. Age-cond=0.584, Reward=0.021 (hidden)
+#   v2   : raw event count -> TST 기준 per-hour rate -> log1p 변환.
+#          11개 feature, threshold=0.58. Age-cond=0.574, Reward=0.050 (hidden)
+#   v3   : v2에 sparse-window EEG spectral feature(delta/theta relative
+#          power, theta/delta ratio) 추가. CAISR feature는 drop-one
+#          ablation으로 plm_index, stage_entropy 제거(redundant 확인),
+#          n3_front_loading_ratio 추가(EEG와 시너지 확인).
+#          Local 검증(S0001->I0006/I0002 + LOSO stress test):
+#            worst age-cond: 0.7345(v2) -> 0.7694 (+0.0349)
+#            site gap: 0.0001 -> 0.0014 (균형 유지)
+#            stress test: 0.5856 -> 0.5937 (개선)
+#            worst reward proxy: 0.3148(v2) -> 0.3563 (+0.0415)
+#          전체 EEG 원본 읽기는 runtime 9.57초/명(p95 20.71초, max 48.71초)
+#          으로 위험했으나, sparse-window 방식은 같은 성능을 유지하면서
+#          runtime을 0.02~0.17초/명 수준으로 낮춤 (full-read와 r=0.83~0.94
+#          상관관계로 신호 보존 확인).
 # ============================================================
 
 import joblib
@@ -34,6 +39,7 @@ import numpy as np
 import os
 import warnings
 import mne
+import pyedflib
 
 mne.set_log_level('ERROR')
 warnings.filterwarnings('ignore')
@@ -43,11 +49,16 @@ warnings.filterwarnings('ignore')
 # ============================================================
 FEATURE_COLS = [
     'log_ma_index', 'log_arousal_index', 'pct_rem', 'pct_nrem', 'pct_n2',
-    'log_ilm_index', 'stage_entropy', 'plm_index',
-    'stage_transition_rate', 'waso_min', 'sleep_ineff'
+    'log_ilm_index', 'stage_transition_rate', 'waso_min', 'sleep_ineff',
+    'n3_front_loading_ratio',
+    'eeg_delta_rel_all', 'eeg_theta_rel_all', 'eeg_theta_delta_ratio'
 ]
 
-THRESHOLD = 0.58
+THRESHOLD = 0.63
+
+# EEG sparse-window 설정
+EEG_N_WINDOWS = 16
+EEG_WINDOW_SEC = 30
 
 # ============================================================
 # 유틸 함수
@@ -123,33 +134,29 @@ def get_event_data(raw, ch_name):
         data = np.round(raw_data).astype(int)
     return data, native_sfreq
 
+def trapz_compat(y, x, axis=-1):
+    try:
+        return np.trapezoid(y, x, axis=axis)
+    except AttributeError:
+        return np.trapz(y, x, axis=axis)
+
 # ============================================================
-# Annotation file 탐색 (v1.1과 동일 - BidsFolder 기반)
+# 파일 탐색 (BidsFolder + SessionID + SiteID 기반)
 # ============================================================
 def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
-    """
-    run_model()용. record = {'BidsFolder':..., 'SiteID':..., 'SessionID':...}
-    BDSPPatientID는 record에 없음. 파일명 패턴:
-    {BidsFolder}_ses-{SessionID}_caisr_annotations.edf
-    """
     annot_base = os.path.join(data_folder, 'algorithmic_annotations')
     if not os.path.isdir(annot_base):
         return None
-
     bids_folder = str(bids_folder).strip() if bids_folder is not None else ''
     session_id  = normalize_session_id(session_id)
     site_id     = str(site_id).strip() if site_id is not None else ''
-
     if not bids_folder or not session_id:
         return None
-
     target_name = f"{bids_folder}_ses-{session_id}_caisr_annotations.edf"
-
     if site_id:
         candidate = os.path.join(annot_base, site_id, target_name)
         if os.path.exists(candidate):
             return candidate
-
     for site_folder in os.listdir(annot_base):
         site_path = os.path.join(annot_base, site_folder)
         if not os.path.isdir(site_path):
@@ -157,13 +164,10 @@ def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
         candidate = os.path.join(site_path, target_name)
         if os.path.exists(candidate):
             return candidate
-
     for root, _, files in os.walk(annot_base):
         for fname in files:
-            if (fname.endswith('.edf')
-                    and bids_folder in fname
-                    and f"ses-{session_id}" in fname
-                    and "caisr" in fname.lower()):
+            if (fname.endswith('.edf') and bids_folder in fname
+                    and f"ses-{session_id}" in fname and "caisr" in fname.lower()):
                 return os.path.join(root, fname)
     return None
 
@@ -184,8 +188,53 @@ def find_annot_file_train(patient_id, data_folder):
                 return os.path.join(site_path, fname)
     return None
 
+def find_phys_file_by_bids(bids_folder, session_id, site_id, data_folder):
+    phys_base = os.path.join(data_folder, 'physiological_data')
+    if not os.path.isdir(phys_base):
+        return None
+    bids_folder = str(bids_folder).strip() if bids_folder is not None else ''
+    session_id  = normalize_session_id(session_id)
+    site_id     = str(site_id).strip() if site_id is not None else ''
+    if not bids_folder or not session_id:
+        return None
+    target_name = f"{bids_folder}_ses-{session_id}.edf"
+    if site_id:
+        candidate = os.path.join(phys_base, site_id, target_name)
+        if os.path.exists(candidate):
+            return candidate
+    for site_folder in os.listdir(phys_base):
+        site_path = os.path.join(phys_base, site_folder)
+        if not os.path.isdir(site_path):
+            continue
+        candidate = os.path.join(site_path, target_name)
+        if os.path.exists(candidate):
+            return candidate
+    for root, _, files in os.walk(phys_base):
+        for fname in files:
+            if (fname.endswith('.edf') and bids_folder in fname
+                    and f"ses-{session_id}" in fname):
+                return os.path.join(root, fname)
+    return None
+
+def find_phys_file_train(patient_id, data_folder):
+    """train_model()용. demographics.csv에는 BDSPPatientID가 항상 존재."""
+    phys_base = os.path.join(data_folder, 'physiological_data')
+    if not os.path.exists(phys_base):
+        return None
+    pid_str = str(patient_id).strip()
+    if not pid_str:
+        return None
+    for site_folder in os.listdir(phys_base):
+        site_path = os.path.join(phys_base, site_folder)
+        if not os.path.isdir(site_path):
+            continue
+        for fname in os.listdir(site_path):
+            if fname.endswith('.edf') and pid_str in fname:
+                return os.path.join(site_path, fname)
+    return None
+
 # ============================================================
-# CAISR feature 추출 (raw count + rate-normalized 둘 다 계산)
+# CAISR feature 추출
 # ============================================================
 def extract_caisr_features(edf_path):
     if not edf_path or not os.path.exists(edf_path):
@@ -198,7 +247,6 @@ def extract_caisr_features(edf_path):
     f = {}
     valid_epochs = None
 
-    # Sleep Architecture
     stage_ch = find_channel(raw, ['stage','caisr'], exclude=['prob'])
     if stage_ch:
         epochs = get_stage_epochs(raw, stage_ch)
@@ -207,6 +255,7 @@ def extract_caisr_features(edf_path):
         if n_ep > 0:
             n_sleep = int(np.sum(valid != 5))
             n_wake  = int(np.sum(valid == 5))
+            half    = n_ep // 2
             f['tst_min']     = round(n_sleep * 30/60, 2)
             f['tib_min']     = round(n_ep * 30/60, 2)
             f['sleep_eff']   = round(n_sleep/n_ep*100, 2)
@@ -223,65 +272,53 @@ def extract_caisr_features(edf_path):
                 valid_epochs = valid
                 f['stage_transition_rate'] = round(
                     float(np.sum(np.diff(valid)!=0))/n_ep, 4)
-                stage_probs = [np.mean(valid==s) for s in [1,2,3,4,5]]
-                f['stage_entropy'] = round(float(
-                    -np.sum([p*np.log(p+1e-9) for p in stage_probs if p>0])), 4)
-                rem_idx = np.where(valid==4)[0]
-                f['rem_latency_min'] = round(
-                    rem_idx[0]*30/60 if len(rem_idx)>0 else n_ep*30/60, 2)
+                f['n3_front_loading_ratio'] = round(
+                    (np.sum(valid[:half]==1)+1e-4)/
+                    (np.sum(valid[half:]==1)+1e-4), 4)
             else:
                 for k in ['pct_n3','pct_n2','pct_n1','pct_rem','pct_nrem',
-                          'stage_transition_rate','stage_entropy','rem_latency_min']:
+                          'stage_transition_rate','n3_front_loading_ratio']:
                     f[k] = np.nan
         else:
             for k in ['tst_min','tib_min','sleep_eff','waso_min','sleep_ineff',
                       'waso_pct','pct_n3','pct_n2','pct_n1','pct_rem','pct_nrem',
-                      'stage_transition_rate','stage_entropy','rem_latency_min']:
+                      'stage_transition_rate','n3_front_loading_ratio']:
                 f[k] = np.nan
 
-    # Respiratory (raw count - n_ma만 v2 feature로 변환됨)
+    # Respiratory (n_ma만 필요)
     resp_ch = find_channel(raw, ['resp','caisr'], exclude=['prob'])
     if resp_ch and not np.isnan(f.get('tst_min', np.nan)):
         resp_data, _ = get_event_data(raw, resp_ch)
         def cnt(vals):
             return count_events(np.isin(resp_data, vals).astype(int))
-        n_oa,n_ca,n_ma,n_hy,n_rera = cnt([1]),cnt([2]),cnt([3]),cnt([4]),cnt([5])
-        f['n_oa']=n_oa; f['n_ca']=n_ca; f['n_ma']=n_ma
-        f['n_hy']=n_hy; f['n_rera']=n_rera
+        f['n_ma'] = cnt([3])
     else:
-        for k in ['n_oa','n_ca','n_ma','n_hy','n_rera']:
-            f[k] = np.nan
+        f['n_ma'] = np.nan
 
-    # Arousal (raw count - n_arousals만 v2 feature로 변환됨)
+    # Arousal
     arou_ch = find_channel(raw, ['arousal','caisr'], exclude=['prob'])
     if arou_ch and not np.isnan(f.get('tst_min', np.nan)):
-        arou_data, arou_sfreq = get_event_data(raw, arou_ch)
-        n_ar = count_events(arou_data)
-        f['n_arousals'] = n_ar
+        arou_data, _ = get_event_data(raw, arou_ch)
+        f['n_arousals'] = count_events(arou_data)
     else:
         f['n_arousals'] = np.nan
 
-    # Limb (raw count n_ilm -> v2 feature, plm_index는 rate 그대로 사용)
+    # Limb (n_ilm만 필요)
     limb_ch = find_channel(raw, ['limb','caisr'], exclude=['prob'])
     if limb_ch and not np.isnan(f.get('tst_min', np.nan)):
         limb_data, _ = get_event_data(raw, limb_ch)
-        tst_h = f['tst_min'] / 60
-        n_plm = count_events((limb_data==2).astype(int))
-        n_ilm = count_events((limb_data==1).astype(int))
-        f['n_plm']     = n_plm
-        f['n_ilm']     = n_ilm
-        f['plm_index'] = round(n_plm/tst_h,3) if tst_h>0 else np.nan
+        f['n_ilm'] = count_events((limb_data==1).astype(int))
     else:
-        f['n_plm']=f['n_ilm']=f['plm_index']=np.nan
+        f['n_ilm'] = np.nan
 
-    # ── v2: raw count -> TST 기준 per-hour rate -> log1p ──────────
+    # raw count -> TST 기준 per-hour rate -> log1p
     tst_hours = max(f.get('tst_min', np.nan)/60.0, 1e-6) \
         if not np.isnan(f.get('tst_min', np.nan)) else np.nan
 
     if not np.isnan(tst_hours) and tst_hours > 0.1:
-        ma_idx       = f.get('n_ma', np.nan) / tst_hours if not np.isnan(f.get('n_ma', np.nan)) else np.nan
-        arousal_idx  = f.get('n_arousals', np.nan) / tst_hours if not np.isnan(f.get('n_arousals', np.nan)) else np.nan
-        ilm_idx      = f.get('n_ilm', np.nan) / tst_hours if not np.isnan(f.get('n_ilm', np.nan)) else np.nan
+        ma_idx      = f.get('n_ma', np.nan)/tst_hours if not np.isnan(f.get('n_ma', np.nan)) else np.nan
+        arousal_idx = f.get('n_arousals', np.nan)/tst_hours if not np.isnan(f.get('n_arousals', np.nan)) else np.nan
+        ilm_idx     = f.get('n_ilm', np.nan)/tst_hours if not np.isnan(f.get('n_ilm', np.nan)) else np.nan
     else:
         ma_idx = arousal_idx = ilm_idx = np.nan
 
@@ -290,6 +327,108 @@ def extract_caisr_features(edf_path):
     f['log_ilm_index']     = round(float(np.log1p(ilm_idx)), 4) if not np.isnan(ilm_idx) else np.nan
 
     return f
+
+# ============================================================
+# EEG sparse-window feature 추출
+# ============================================================
+def pick_eeg_channel_pyedf(labels):
+    labels_lower = [l.lower() for l in labels]
+    priorities = [['c3-m2'],['c3-a2'],['c3'],
+                  ['f3-m2'],['f3-a2'],['f3'],
+                  ['c4-m1'],['c4-a1'],['c4'],
+                  ['o1-m2'],['o1-a2'],['o1']]
+    for kws in priorities:
+        for i, l in enumerate(labels_lower):
+            if all(k in l for k in kws):
+                return i, labels[i]
+    return None, None
+
+def extract_eeg_relative_sparse(phys_path, n_windows=EEG_N_WINDOWS, window_sec=EEG_WINDOW_SEC):
+    keys = ['eeg_delta_rel_all','eeg_theta_rel_all','eeg_theta_delta_ratio']
+    default = {k: np.nan for k in keys}
+
+    if not phys_path or not os.path.exists(phys_path):
+        return default
+    try:
+        f = pyedflib.EdfReader(phys_path)
+        labels = f.getSignalLabels()
+        idx, ch_name = pick_eeg_channel_pyedf(labels)
+        if idx is None:
+            f.close()
+            return default
+        fs_orig = f.getSampleFrequency(idx)
+        n_samples_total = f.getNSamples()[idx]
+
+        win_samples = int(window_sec * fs_orig)
+        positions = np.linspace(0.1, 0.9, n_windows)
+
+        segments = []
+        for p in positions:
+            start_sample = int(p * n_samples_total)
+            start_sample = min(start_sample, max(n_samples_total - win_samples, 0))
+            start_sample = max(start_sample, 0)
+            seg = f.readSignal(idx, start=start_sample, n=win_samples)
+            segments.append(seg)
+        f.close()
+    except:
+        try: f.close()
+        except: pass
+        return default
+
+    try:
+        from scipy.signal import welch, butter, filtfilt, resample
+
+        eeg_data = np.concatenate(segments)
+
+        if np.nanstd(eeg_data) < 0.01:
+            eeg_data = eeg_data * 1e6
+
+        fs = fs_orig
+        if fs_orig != 100:
+            n_new = int(len(eeg_data) * 100 / fs_orig)
+            eeg_data = resample(eeg_data, n_new)
+            fs = 100.0
+
+        b, a = butter(4, [0.5/(fs/2), 30/(fs/2)], btype='band')
+        eeg_f = filtfilt(b, a, eeg_data)
+
+        seg_len = int(fs * window_sec)
+        n_segs  = len(eeg_f) // seg_len
+        if n_segs < 3:
+            return default
+        segs_2d = eeg_f[:n_segs*seg_len].reshape(n_segs, seg_len)
+
+        amp = np.ptp(segs_2d, axis=1)
+        std = np.std(segs_2d, axis=1)
+        amp_thresh = np.nanpercentile(amp, 95) if n_segs > 5 else amp.max()+1
+        good_mask = (amp < amp_thresh) & (std > 1e-4)
+        good_segs = segs_2d[good_mask]
+
+        if len(good_segs) < 3:
+            return default
+
+        nperseg = min(int(fs*4), good_segs.shape[1])
+        freqs, psd = welch(good_segs, fs=fs, nperseg=nperseg, axis=1)
+
+        delta_mask = (freqs >= 0.5) & (freqs < 4)
+        theta_mask = (freqs >= 4) & (freqs < 8)
+        total_mask = (freqs >= 0.5) & (freqs < 30)
+
+        delta_power = trapz_compat(psd[:, delta_mask], freqs[delta_mask], axis=1)
+        theta_power = trapz_compat(psd[:, theta_mask], freqs[theta_mask], axis=1)
+        total_power = trapz_compat(psd[:, total_mask], freqs[total_mask], axis=1)
+
+        delta_rel = delta_power / (total_power + 1e-10)
+        theta_rel = theta_power / (total_power + 1e-10)
+
+        result = {}
+        result['eeg_delta_rel_all'] = round(float(np.nanmean(delta_rel)), 6)
+        result['eeg_theta_rel_all'] = round(float(np.nanmean(theta_rel)), 6)
+        result['eeg_theta_delta_ratio'] = round(
+            float(np.nanmean(theta_power) / max(np.nanmean(delta_power), 1e-8)), 6)
+        return result
+    except:
+        return default
 
 # ============================================================
 # train_model
@@ -311,13 +450,19 @@ def train_model(data_folder, model_folder, verbose=False):
              'FALSE':False,'False':False,'false':False})
 
     if verbose:
-        print(f'Extracting CAISR features for {len(demo)} patients...')
+        print(f'Extracting CAISR + EEG features for {len(demo)} patients...')
 
     records = []
     for i, (_, row) in enumerate(demo.iterrows()):
-        edf_path = find_annot_file_train(row['BDSPPatientID'], data_folder)
-        feats    = extract_caisr_features(edf_path)
-        feats['BDSPPatientID'] = row['BDSPPatientID']
+        pid = row['BDSPPatientID']
+        annot_path = find_annot_file_train(pid, data_folder)
+        caisr_feat = extract_caisr_features(annot_path)
+
+        phys_path = find_phys_file_train(pid, data_folder)
+        eeg_feat = extract_eeg_relative_sparse(phys_path)
+
+        feats = {**caisr_feat, **eeg_feat}
+        feats['BDSPPatientID'] = pid
         records.append(feats)
         if verbose and (i+1) % 500 == 0:
             print(f'  [{i+1}/{len(demo)}]')
@@ -325,11 +470,6 @@ def train_model(data_folder, model_folder, verbose=False):
     caisr_df = pd.DataFrame(records)
     df = demo[['BDSPPatientID','Cognitive_Impairment']].merge(
         caisr_df, on='BDSPPatientID', how='left')
-
-    # plm_index winsorize (n_ilm은 log1p로 이미 변환됐으므로 극단값 영향 적음)
-    if 'plm_index' in df.columns:
-        cap = df['plm_index'].quantile(0.99)
-        df['plm_index'] = df['plm_index'].clip(upper=cap)
 
     # Training data median imputation (NaN fallback 포함)
     impute_vals = {}
@@ -398,8 +538,13 @@ def run_model(model_dict, record, data_folder, verbose=False):
         site_id     = record.get('SiteID', '')
         session_id  = record.get('SessionID', '')
 
-        edf_path = find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder)
-        feat = extract_caisr_features(edf_path) if edf_path else {}
+        annot_path = find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder)
+        caisr_feat = extract_caisr_features(annot_path) if annot_path else {}
+
+        phys_path = find_phys_file_by_bids(bids_folder, session_id, site_id, data_folder)
+        eeg_feat = extract_eeg_relative_sparse(phys_path) if phys_path else {}
+
+        feat = {**caisr_feat, **eeg_feat}
 
         feat_vec = []
         for col in features:
