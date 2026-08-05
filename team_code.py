@@ -1,38 +1,4 @@
 #!/usr/bin/env python
-
-# ============================================================
-# PhysioNet Challenge 2026 | Team: Momochi-SleepAI
-#
-# Model    : LogisticRegression + StandardScaler
-# Features : 13개 (CAISR rate-normalized 10개 + sparse EEG 3개)
-# Strategy : v2(rate-normalized CAISR)에 sparse-window EEG spectral
-#            feature를 추가. raw EEG 전체를 읽지 않고 deterministic
-#            sparse window(16 x 30초, 10~90% 위치)만 읽어 runtime을
-#            CAISR 수준으로 유지하면서 EEG 정보를 반영.
-# Threshold: 0.63 (prevalence-based reward 최적화, plateau 확인됨)
-#
-# Version history:
-#   v1   : run_model()에서 BDSPPatientID로 환자 식별 -> hidden record에
-#          BDSPPatientID가 없어 매칭 실패 버그. Age-cond AUROC=0.500
-#   v1.1 : BidsFolder+SiteID+SessionID 기반 매칭으로 수정.
-#          12개 raw-count CAISR feature. Age-cond=0.584, Reward=0.021 (hidden)
-#   v2   : raw event count -> TST 기준 per-hour rate -> log1p 변환.
-#          11개 feature, threshold=0.58. Age-cond=0.574, Reward=0.050 (hidden)
-#   v3   : v2에 sparse-window EEG spectral feature(delta/theta relative
-#          power, theta/delta ratio) 추가. CAISR feature는 drop-one
-#          ablation으로 plm_index, stage_entropy 제거(redundant 확인),
-#          n3_front_loading_ratio 추가(EEG와 시너지 확인).
-#          Local 검증(S0001->I0006/I0002 + LOSO stress test):
-#            worst age-cond: 0.7345(v2) -> 0.7694 (+0.0349)
-#            site gap: 0.0001 -> 0.0014 (균형 유지)
-#            stress test: 0.5856 -> 0.5937 (개선)
-#            worst reward proxy: 0.3148(v2) -> 0.3563 (+0.0415)
-#          전체 EEG 원본 읽기는 runtime 9.57초/명(p95 20.71초, max 48.71초)
-#          으로 위험했으나, sparse-window 방식은 같은 성능을 유지하면서
-#          runtime을 0.02~0.17초/명 수준으로 낮춤 (full-read와 r=0.83~0.94
-#          상관관계로 신호 보존 확인).
-# ============================================================
-
 import joblib
 import json
 import numpy as np
@@ -44,25 +10,27 @@ import pyedflib
 mne.set_log_level('ERROR')
 warnings.filterwarnings('ignore')
 
-# ============================================================
-# 확정 feature 목록 (순서 고정 - 변경 금지)
-# ============================================================
-FEATURE_COLS = [
+# MG1: montage-gated A / PE
+FEATURE_COLS_A = [
     'log_ma_index', 'log_arousal_index', 'pct_rem', 'pct_nrem', 'pct_n2',
     'log_ilm_index', 'stage_transition_rate', 'waso_min', 'sleep_ineff',
     'n3_front_loading_ratio',
     'eeg_delta_rel_all', 'eeg_theta_rel_all', 'eeg_theta_delta_ratio'
 ]
+FEATURE_COLS_PE = FEATURE_COLS_A + ['alpha_peak_frequency_occipital', 'stage_entropy_std']
+INVALID_STAGES = [0, 9]
 
 THRESHOLD = 0.63
-
-# EEG sparse-window 설정
 EEG_N_WINDOWS = 16
 EEG_WINDOW_SEC = 30
 
-# ============================================================
-# 유틸 함수
-# ============================================================
+# occipital alpha_peak (v5b windowed 파이프라인과 동일 파라미터)
+OCC_TARGET_FS = 100
+OCC_EPOCH_SEC = 30
+OCC_MIN_EP    = 5
+OCC_K_STAGE   = 10
+OCC_U_UNIFORM = 30
+
 def safe_float(x, default=np.nan):
     try:
         if x is None:
@@ -74,7 +42,6 @@ def safe_float(x, default=np.nan):
         return default
 
 def normalize_session_id(session_id):
-    """1, 1.0, '1', '1.0' 등 다양한 형태를 '1'로 통일"""
     try:
         if isinstance(session_id, float) and session_id.is_integer():
             return str(int(session_id))
@@ -140,9 +107,6 @@ def trapz_compat(y, x, axis=-1):
     except AttributeError:
         return np.trapz(y, x, axis=axis)
 
-# ============================================================
-# 파일 탐색 (BidsFolder + SessionID + SiteID 기반)
-# ============================================================
 def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
     annot_base = os.path.join(data_folder, 'algorithmic_annotations')
     if not os.path.isdir(annot_base):
@@ -172,7 +136,6 @@ def find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder):
     return None
 
 def find_annot_file_train(patient_id, data_folder):
-    """train_model()용. demographics.csv에는 BDSPPatientID가 항상 존재."""
     annot_base = os.path.join(data_folder, 'algorithmic_annotations')
     if not os.path.exists(annot_base):
         return None
@@ -217,7 +180,6 @@ def find_phys_file_by_bids(bids_folder, session_id, site_id, data_folder):
     return None
 
 def find_phys_file_train(patient_id, data_folder):
-    """train_model()용. demographics.csv에는 BDSPPatientID가 항상 존재."""
     phys_base = os.path.join(data_folder, 'physiological_data')
     if not os.path.exists(phys_base):
         return None
@@ -233,9 +195,6 @@ def find_phys_file_train(patient_id, data_folder):
                 return os.path.join(site_path, fname)
     return None
 
-# ============================================================
-# CAISR feature 추출
-# ============================================================
 def extract_caisr_features(edf_path):
     if not edf_path or not os.path.exists(edf_path):
         return {}
@@ -285,7 +244,6 @@ def extract_caisr_features(edf_path):
                       'stage_transition_rate','n3_front_loading_ratio']:
                 f[k] = np.nan
 
-    # Respiratory (n_ma만 필요)
     resp_ch = find_channel(raw, ['resp','caisr'], exclude=['prob'])
     if resp_ch and not np.isnan(f.get('tst_min', np.nan)):
         resp_data, _ = get_event_data(raw, resp_ch)
@@ -295,7 +253,6 @@ def extract_caisr_features(edf_path):
     else:
         f['n_ma'] = np.nan
 
-    # Arousal
     arou_ch = find_channel(raw, ['arousal','caisr'], exclude=['prob'])
     if arou_ch and not np.isnan(f.get('tst_min', np.nan)):
         arou_data, _ = get_event_data(raw, arou_ch)
@@ -303,7 +260,6 @@ def extract_caisr_features(edf_path):
     else:
         f['n_arousals'] = np.nan
 
-    # Limb (n_ilm만 필요)
     limb_ch = find_channel(raw, ['limb','caisr'], exclude=['prob'])
     if limb_ch and not np.isnan(f.get('tst_min', np.nan)):
         limb_data, _ = get_event_data(raw, limb_ch)
@@ -311,7 +267,6 @@ def extract_caisr_features(edf_path):
     else:
         f['n_ilm'] = np.nan
 
-    # raw count -> TST 기준 per-hour rate -> log1p
     tst_hours = max(f.get('tst_min', np.nan)/60.0, 1e-6) \
         if not np.isnan(f.get('tst_min', np.nan)) else np.nan
 
@@ -328,9 +283,6 @@ def extract_caisr_features(edf_path):
 
     return f
 
-# ============================================================
-# EEG sparse-window feature 추출
-# ============================================================
 def pick_eeg_channel_pyedf(labels):
     labels_lower = [l.lower() for l in labels]
     priorities = [['c3-m2'],['c3-a2'],['c3'],
@@ -431,8 +383,176 @@ def extract_eeg_relative_sparse(phys_path, n_windows=EEG_N_WINDOWS, window_sec=E
         return default
 
 # ============================================================
-# train_model
+# occipital alpha_peak 추출 (v5b windowed 이식 = parity)
 # ============================================================
+def _occ_clean(s):
+    return s.lower().replace('eeg','').replace(':','-').replace('/','-').replace('_','').strip()
+
+_OCC_DERIV = [('o1', ['m2','a2']), ('o2', ['m1','a1'])]
+
+def _resolve_occ(labels):
+    cl = [_occ_clean(l) for l in labels]
+    for prim, refs in _OCC_DERIV:
+        for i, c in enumerate(cl):
+            if prim in c and any(r in c for r in refs):
+                return ('direct', i, None)
+        pi = next((i for i, c in enumerate(cl) if c == prim), None)
+        if pi is not None:
+            for r in refs:
+                ri = next((i for i, c in enumerate(cl) if c == r), None)
+                if ri is not None:
+                    return ('derive', pi, ri)
+    return (None, None, None)
+
+def _occ_decode_stage(raw, fs):
+    spe = fs * OCC_EPOCH_SEC
+    if spe < 1.5:
+        return np.round(raw).astype(int)
+    return np.round(raw[::int(round(spe))]).astype(int)
+
+def _occ_load_stage(annot_path):
+    try:
+        f = pyedflib.EdfReader(annot_path)
+        labels = f.getSignalLabels()
+        idx = next((i for i, l in enumerate(labels)
+                    if 'stage' in l.lower() and 'caisr' in l.lower() and 'prob' not in l.lower()), None)
+        if idx is None:
+            f.close(); return None
+        raw = f.readSignal(idx); fs = f.getSampleFrequency(idx); f.close()
+        return _occ_decode_stage(raw, fs)
+    except:
+        try: f.close()
+        except: pass
+        return None
+
+def _occ_select_epochs(stage):
+    sel = set()
+    for s in [1, 2, 3, 4, 5]:
+        idx = np.where(stage == s)[0]
+        if len(idx) == 0:
+            continue
+        pick = idx if len(idx) <= OCC_K_STAGE else idx[np.linspace(0, len(idx)-1, OCC_K_STAGE).astype(int)]
+        sel.update(pick.tolist())
+    n = len(stage)
+    sel.update(set(np.linspace(0, n-1, min(OCC_U_UNIFORM, n)).astype(int).tolist()))
+    return sorted(sel)
+
+def _occ_read_win(f, mode, pi, ri, fs, e, nsamp):
+    L = int(fs * OCC_EPOCH_SEC); start = int(e * L)
+    if start + L > nsamp[pi]:
+        start = max(nsamp[pi] - L, 0)
+    try:
+        a = f.readSignal(pi, start=start, n=L)
+        if mode == 'derive':
+            b = f.readSignal(ri, start=start, n=L); a = a - b[:len(a)]
+        return np.asarray(a, float)
+    except:
+        return None
+
+def _occ_win_alpha_peak(win, fs):
+    if win is None or len(win) < fs * 5:
+        return None
+    from scipy.signal import welch, butter, filtfilt, resample_poly
+    if abs(fs - OCC_TARGET_FS) > 0.1:
+        up, down = OCC_TARGET_FS, int(round(fs)); g = np.gcd(up, down)
+        win = resample_poly(win, up // g, down // g)
+    fsr = float(OCC_TARGET_FS)
+    if not np.isfinite(win).all() or np.std(win) < 1e-6:
+        return None
+    try:
+        b, a = butter(4, [0.5/(fsr/2), 35/(fsr/2)], btype='band'); win = filtfilt(b, a, win)
+    except:
+        return None
+    fr, psd = welch(win, fs=fsr, nperseg=min(int(fsr*4), len(win)))
+    amk = (fr >= 7) & (fr <= 13)
+    return fr[amk][np.argmax(psd[amk])]
+
+def extract_occipital_alpha_peak(phys_path, annot_path):
+    default = {'alpha_peak_frequency_occipital': np.nan}
+    if not phys_path or not os.path.exists(phys_path):
+        return default
+    stage = _occ_load_stage(annot_path) if annot_path else None
+    if stage is None:
+        return default
+    try:
+        f = pyedflib.EdfReader(phys_path)
+        labels = f.getSignalLabels(); nsamp = f.getNSamples()
+        mode, pi, ri = _resolve_occ(labels)
+        if mode is None:
+            f.close(); return default
+        fs = f.getSampleFrequency(pi)
+        sel = _occ_select_epochs(stage)
+        max_ep = nsamp[pi] // int(fs * OCC_EPOCH_SEC)
+        sel = [e for e in sel if e < max_ep and e < len(stage)]
+        peaks = []
+        for e in sel:
+            if int(stage[e]) in (4, 5):   # REM + Wake
+                peaks.append(_occ_win_alpha_peak(_occ_read_win(f, mode, pi, ri, fs, e, nsamp), fs))
+        f.close()
+        v = np.array([x for x in peaks if x is not None and np.isfinite(x)])
+        return {'alpha_peak_frequency_occipital': float(np.median(v)) if len(v) >= OCC_MIN_EP else np.nan}
+    except:
+        try: f.close()
+        except: pass
+        return default
+
+def extract_stage_entropy_std(annot_path):
+    """CAISR stage-probability(N3,N2,N1,REM,W) entropy의 환자 내 std.
+       arousal_extract.py와 동일 로직 (parity)."""
+    default = {'stage_entropy_std': np.nan}
+    if not annot_path or not os.path.exists(annot_path):
+        return default
+    try:
+        f = pyedflib.EdfReader(annot_path)
+        labels = f.getSignalLabels()
+        si = next((i for i, l in enumerate(labels)
+                   if 'stage' in l.lower() and 'caisr' in l.lower() and 'prob' not in l.lower()), None)
+        prob_idx = {}
+        for key in ['n3', 'n2', 'n1', 'r', 'w']:
+            j = next((i for i, l in enumerate(labels)
+                      if l.lower() == f'caisr_prob_{key}' or l.lower().endswith(f'prob_{key}')), None)
+            if j is not None:
+                prob_idx[key] = j
+        if si is None or len(prob_idx) != 5:
+            f.close(); return default
+        sfs = f.getSampleFrequency(si)
+        stage = _occ_decode_stage(f.readSignal(si), sfs)
+        P = []
+        for key in ['n3', 'n2', 'n1', 'r', 'w']:
+            pr = f.readSignal(prob_idx[key]); pfs = f.getSampleFrequency(prob_idx[key])
+            pe = pr if pfs * 30 < 1.5 else pr[::int(round(pfs * 30))]
+            P.append(pe)
+        f.close()
+        m = min(len(p) for p in P)
+        P = np.vstack([p[:m] for p in P]).T
+        stg = stage[:m] if len(stage) >= m else np.concatenate([stage, [9] * (m - len(stage))])
+        valid = ~np.isin(stg, INVALID_STAGES)
+        Pv = P[valid]
+        if len(Pv) < 10:
+            return default
+        s = Pv.sum(axis=1, keepdims=True)
+        Pn = np.clip(Pv / np.where(s > 0, s, 1), 1e-12, 1)
+        ent = -np.sum(Pn * np.log(Pn), axis=1)
+        return {'stage_entropy_std': float(np.std(ent))}
+    except:
+        try: f.close()
+        except: pass
+        return default
+
+def resolve_occipital_mode(phys_path):
+    """occipital 채널 mode: 'direct'/'derive'/'missing'. alpha 추출 resolver와 동일 소스."""
+    if not phys_path or not os.path.exists(phys_path):
+        return 'missing'
+    try:
+        f = pyedflib.EdfReader(phys_path)
+        labels = f.getSignalLabels(); f.close()
+        mode, pi, ri = _resolve_occ(labels)
+        return mode if mode is not None else 'missing'
+    except:
+        try: f.close()
+        except: pass
+        return 'missing'
+
 def train_model(data_folder, model_folder, verbose=False):
     import pandas as pd
     from sklearn.linear_model import LogisticRegression
@@ -440,123 +560,100 @@ def train_model(data_folder, model_folder, verbose=False):
     from sklearn.pipeline import Pipeline
 
     os.makedirs(model_folder, exist_ok=True)
-    if verbose:
-        print('Loading demographics...')
-
     demo = pd.read_csv(os.path.join(data_folder, 'demographics.csv'))
     if demo['Cognitive_Impairment'].dtype == object:
         demo['Cognitive_Impairment'] = demo['Cognitive_Impairment'].map(
             {'TRUE':True,'True':True,'true':True,
              'FALSE':False,'False':False,'false':False})
 
-    if verbose:
-        print(f'Extracting CAISR + EEG features for {len(demo)} patients...')
-
     records = []
     for i, (_, row) in enumerate(demo.iterrows()):
         pid = row['BDSPPatientID']
         annot_path = find_annot_file_train(pid, data_folder)
         caisr_feat = extract_caisr_features(annot_path)
-
         phys_path = find_phys_file_train(pid, data_folder)
         eeg_feat = extract_eeg_relative_sparse(phys_path)
-
-        feats = {**caisr_feat, **eeg_feat}
+        occ_feat = extract_occipital_alpha_peak(phys_path, annot_path)
+        ent_feat = extract_stage_entropy_std(annot_path)
+        feats = {**caisr_feat, **eeg_feat, **occ_feat, **ent_feat}
         feats['BDSPPatientID'] = pid
         records.append(feats)
-        if verbose and (i+1) % 500 == 0:
+        if verbose and (i+1) % 200 == 0:
             print(f'  [{i+1}/{len(demo)}]')
 
     caisr_df = pd.DataFrame(records)
     df = demo[['BDSPPatientID','Cognitive_Impairment']].merge(
         caisr_df, on='BDSPPatientID', how='left')
-
-    # Training data median imputation (NaN fallback 포함)
-    impute_vals = {}
-    for col in FEATURE_COLS:
-        if col in df.columns:
-            med = df[col].median()
-            if not np.isfinite(med):
-                med = 0.0
-            impute_vals[col] = float(med)
-            df[col] = df[col].fillna(med)
-
-    X = df[FEATURE_COLS].values.astype(float)
     y = df['Cognitive_Impairment'].astype(int).values
 
+    def fit_one(cols):
+        impute = {}
+        Xdf = df[cols].copy()
+        for c in cols:
+            med = Xdf[c].median()
+            if not np.isfinite(med): med = 0.0
+            impute[c] = float(med)
+            Xdf[c] = Xdf[c].fillna(med)
+        model = Pipeline([('scaler', StandardScaler()),
+                          ('clf', LogisticRegression(class_weight='balanced',
+                                                     max_iter=1000, random_state=42))])
+        model.fit(Xdf[cols].values.astype(float), y)
+        return model, impute
+
+    model_A,  impute_A  = fit_one(FEATURE_COLS_A)
+    model_PE, impute_PE = fit_one(FEATURE_COLS_PE)
+
+    joblib.dump(model_A,  os.path.join(model_folder, 'model_A.pkl'))
+    joblib.dump(model_PE, os.path.join(model_folder, 'model_PE.pkl'))
+    with open(os.path.join(model_folder, 'meta.json'), 'w') as fj:
+        json.dump({'features_A': FEATURE_COLS_A, 'features_PE': FEATURE_COLS_PE,
+                   'impute_A': impute_A, 'impute_PE': impute_PE,
+                   'threshold': THRESHOLD}, fj)
     if verbose:
-        print(f'Training LR+Scaler... (n={len(X)}, CI={y.sum()})')
+        print('MG1 models saved (A + PE).')
 
-    model = Pipeline([
-        ('scaler', StandardScaler()),
-        ('clf', LogisticRegression(
-            class_weight='balanced', max_iter=1000, random_state=42))
-    ])
-    model.fit(X, y)
-
-    joblib.dump(model, os.path.join(model_folder, 'model.pkl'))
-    with open(os.path.join(model_folder, 'features.json'), 'w') as fj:
-        json.dump(FEATURE_COLS, fj)
-    with open(os.path.join(model_folder, 'impute_vals.json'), 'w') as fj:
-        json.dump(impute_vals, fj)
-    with open(os.path.join(model_folder, 'threshold.json'), 'w') as fj:
-        json.dump({'threshold': THRESHOLD}, fj)
-
-    if verbose:
-        print('Model saved!')
-
-# ============================================================
-# load_model
-# ============================================================
 def load_model(model_folder, verbose=False):
-    model = joblib.load(os.path.join(model_folder, 'model.pkl'))
-    with open(os.path.join(model_folder, 'features.json')) as f:
-        features = json.load(f)
-    with open(os.path.join(model_folder, 'impute_vals.json')) as f:
-        impute_vals = json.load(f)
-    threshold = THRESHOLD
-    if os.path.exists(os.path.join(model_folder, 'threshold.json')):
-        with open(os.path.join(model_folder, 'threshold.json')) as f:
-            threshold = json.load(f)['threshold']
+    model_A  = joblib.load(os.path.join(model_folder, 'model_A.pkl'))
+    model_PE = joblib.load(os.path.join(model_folder, 'model_PE.pkl'))
+    with open(os.path.join(model_folder, 'meta.json')) as f:
+        meta = json.load(f)
     if verbose:
-        print(f'Model loaded! threshold={threshold}')
-    return {'model': model, 'features': features,
-            'impute_vals': impute_vals, 'threshold': threshold}
+        print('MG1 models loaded. threshold=', meta['threshold'])
+    return {'model_A': model_A, 'model_PE': model_PE, 'meta': meta}
 
-# ============================================================
-# run_model
-# ============================================================
 def run_model(model_dict, record, data_folder, verbose=False):
     try:
-        clf         = model_dict['model']
-        features    = model_dict['features']
-        impute_vals = model_dict['impute_vals']
-        threshold   = model_dict.get('threshold', THRESHOLD)
-
-        # record = {'BidsFolder':..., 'SiteID':..., 'SessionID':...}
+        meta = model_dict['meta']
+        threshold = meta.get('threshold', THRESHOLD)
         bids_folder = record.get('BidsFolder', '')
         site_id     = record.get('SiteID', '')
         session_id  = record.get('SessionID', '')
 
         annot_path = find_annot_file_by_bids(bids_folder, session_id, site_id, data_folder)
+        phys_path  = find_phys_file_by_bids(bids_folder, session_id, site_id, data_folder)
+
         caisr_feat = extract_caisr_features(annot_path) if annot_path else {}
+        eeg_feat   = extract_eeg_relative_sparse(phys_path) if phys_path else {}
+        occ_feat   = extract_occipital_alpha_peak(phys_path, annot_path) if phys_path else {}
+        ent_feat   = extract_stage_entropy_std(annot_path) if annot_path else {}
+        feat = {**caisr_feat, **eeg_feat, **occ_feat, **ent_feat}
 
-        phys_path = find_phys_file_by_bids(bids_folder, session_id, site_id, data_folder)
-        eeg_feat = extract_eeg_relative_sparse(phys_path) if phys_path else {}
+        # montage-gated hard routing: direct -> PE, else(derive/missing) -> A
+        mode = resolve_occipital_mode(phys_path)
+        if mode == 'direct':
+            model = model_dict['model_PE']; cols = meta['features_PE']; impute = meta['impute_PE']
+        else:
+            model = model_dict['model_A'];  cols = meta['features_A'];  impute = meta['impute_A']
 
-        feat = {**caisr_feat, **eeg_feat}
-
-        feat_vec = []
-        for col in features:
+        vec = []
+        for col in cols:
             v = feat.get(col, np.nan)
             if v is None or (isinstance(v, float) and np.isnan(v)):
-                v = impute_vals.get(col, 0.0)
-            feat_vec.append(float(v))
-
-        prob   = float(clf.predict_proba([feat_vec])[0][1])
+                v = impute.get(col, 0.0)
+            vec.append(float(v))
+        prob = float(model.predict_proba([vec])[0][1])
         binary = int(prob >= threshold)
         return binary, prob
-
     except Exception as e:
         if verbose:
             print(f'Error: {e}')
